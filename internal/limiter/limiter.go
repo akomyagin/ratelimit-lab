@@ -31,6 +31,12 @@ type Limiter interface {
 //
 // It is introduced in the port here (Этап 0) so that every algorithm added
 // later shares one time source and the race/stress tests stay deterministic.
+//
+// Now must be non-decreasing across successive calls: every implementation's
+// refill/leak/window math computes elapsed := now.Sub(last) and assumes
+// elapsed >= 0. realClock upholds this via Go's monotonic clock reading inside
+// time.Time; a fake Clock used in tests must likewise never be made to go
+// backward.
 type Clock interface {
 	Now() time.Time
 }
