@@ -216,7 +216,9 @@ CLI — заменить заглушку `cmd/bench/main.go` (тонкий ха
   весь пакет (не только на lock-free — mutex-версии тоже прогоняются под гонки).
 - Производительность — `testing.B` + `b.RunParallel`; `cmd/bench` — человеко-
   ориентированный сравнительный харнесс поверх тех же лимитеров.
-- CI-эквивалент локально: `go build ./... && go vet ./... && go test -race ./...`.
+- CI (`.github/workflows/ci.yml`, GitHub Actions на push/PR в `master`) гоняет
+  `go build ./... && go vet ./... && gofmt -l .` (пусто) `&& go test -race ./...`
+  — тот же набор команд можно выполнить локально перед коммитом.
 
 ## 8. Docker Compose — решение: НЕ заводим
 
