@@ -19,6 +19,12 @@ based lock-free token bucket, сравнение throughput/latency под ко�
 
 ## Структура репозитория
 
+Текущее состояние (Этап 0): `limiter.go` реализован (порт `Limiter` + `Clock` +
+`SystemClock`); `tokenbucket.go`/`slidingwindow.go`/`leakybucket.go` и
+`cmd/bench/main.go` — **заглушки** (`panic`/`TODO(Этап N)`);
+`lockfree_tokenbucket.go` **ещё не создан** (появится в Этапе 4). Столбец
+«Содержимое» ниже описывает целевое назначение файла и этап реализации.
+
 | Путь | Содержимое |
 |---|---|
 | `docs/` | `PLAN.md`, `TECHNICAL_PLAN.md`, `POST_MVP_PLAN.md` |

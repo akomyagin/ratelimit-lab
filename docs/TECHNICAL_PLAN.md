@@ -47,6 +47,17 @@ type Limiter interface {
 `var _ Limiter = (*T)(nil)` в каждом файле (эти assertions заведены уже в Этапе 0
 поверх заглушек, чтобы интерфейс не «уплыл» незаметно).
 
+Семантика, общая для всех реализаций (зафиксировано на уровне порта; см. также
+doc-комментарий в `internal/limiter/limiter.go`):
+
+- `AllowN(n)` — **всё-или-ничего**: либо списываются все `n` единиц ёмкости и
+  возвращается `true`, либо не списывается ничего и возвращается `false`. Частичного
+  списания нет.
+- `Allow()` — это `AllowN(1)` (реализуй как `return x.AllowN(1)`, вся логика в
+  `AllowN`).
+- `AllowN(n)` при `n <= 0` — вырожденный вход: возвращает `true` и **не** трогает
+  состояние (нулевой батч всегда «влезает»). Это единый контракт для всех алгоритмов.
+
 ## 4. Абстракция времени: `Clock`
 
 Все лимитеры зависят от времени (refill, leak, окно). Прямой вызов `time.Now()`
@@ -87,38 +98,116 @@ Fake-clock появляется в Этапе 1 вместе с первым а�
 SKILL. **Критерий готовности:** `go build ./...` и `go vet ./...` проходят чисто.
 
 ### Этап 1 — Token bucket + база тестов
-Mutex-based `TokenBucket` (конструктор с `rate`, `capacity`, `Clock`); refill-
-математика. Fake-clock. Table-driven тесты корректности (пустой/полный бакет,
-refill во времени, `AllowN`). Первый прогон `go test -race ./...`. **Готово:**
-детерминированные тесты зелёные под `-race`.
+Реализация — в `internal/limiter/tokenbucket.go` (**заменить** тело заглушки, не
+плодить `*_v2.go`; assertion `var _ Limiter = (*TokenBucket)(nil)` сохранить).
+
+- **Тип и поля.** `TokenBucket` хранит: текущий уровень токенов (`float64` —
+  refill даёт дробные токены между вызовами), `rate float64` (токенов/сек),
+  `capacity float64`, метку времени последнего пересчёта (`time.Time`), инжек-
+  тированный `clk Clock` и `sync.Mutex` для сериализации `AllowN`.
+- **Конструктор.** `NewTokenBucket(rate float64, capacity int, clk Clock) *TokenBucket`
+  — сигнатура по SKILL §2 (`Clock` последним параметром). Начальный уровень —
+  полный бакет (`capacity` токенов), метка времени — `clk.Now()`.
+- **refill-математика (leak-as-arithmetic, без фоновой горутины).** В начале
+  `AllowN` под мьютексом: `now := clk.Now()`; `elapsed := now.Sub(last)`;
+  `tokens = min(capacity, tokens + elapsed.Seconds()*rate)`; `last = now`. Затем:
+  если `n <= 0` → `true` (состояние не трогать); если `tokens >= float64(n)` →
+  `tokens -= float64(n)`, `true`; иначе `false`.
+- **Fake-clock.** Завести потокобезопасный `fakeClock` (SKILL §3) — в
+  `internal/limiter/clock_test.go` или как тест-хелпер; переиспользуется всеми
+  последующими этапами.
+- **Тесты** (`internal/limiter/tokenbucket_test.go`, table-driven, fake-clock,
+  без `Sleep`). Обязательные кейсы: полный бакет пропускает до `capacity` подряд,
+  затем денаит; пустой бакет при нулевом `elapsed` денаит; `Advance` на время,
+  дающее ровно K токенов, разрешает ровно K запросов; refill клампится по
+  `capacity` (долгое ожидание не копит сверх ёмкости); `AllowN(n)` списывает `n`
+  атомарно (частичного списания нет); `AllowN(0)` и `AllowN(-1)` → `true` без
+  изменения состояния. `-race`-прогон всего пакета.
+
+**Готово:** перечисленные детерминированные тесты зелёные под
+`go test -race ./...`; `gofmt -l .` пусто.
 
 ### Этап 2 — Sliding window
-`SlidingWindow` (выбранный вариант — см. §5, решение зафиксировать здесь при
-реализации). Тесты, отдельно — поведение на **границе окна** (то, чем sliding
-лучше наивного fixed-window: нет всплеска 2×limit на стыке). **Готово:** тест
-границы окна зелёный.
+Реализация — в `internal/limiter/slidingwindow.go` (заменить заглушку, assertion
+сохранить). Тип `SlidingWindow`, конструктор
+`NewSlidingWindow(limit int, window time.Duration, clk Clock) *SlidingWindow`
+(`limit` запросов на скользящее окно `window`; `Clock` последним).
+
+- **Открытое решение (за автором):** log (точный, память O(запросов в окне)) vs
+  weighted counter (аппроксимация двух fixed-окон, память O(1)). Дефолт §5 —
+  weighted counter. Выбор **зафиксировать здесь** при реализации одной строкой с
+  обоснованием; поля типа зависят от выбора (log → срез меток времени под
+  мьютексом; counter → два счётчика + граница окна).
+- **Тесты** (`internal/limiter/slidingwindow_test.go`). Ключевой кейс — **граница
+  окна:** `limit` запросов в конце окна N и ещё `limit` в начале окна N+1 в наивном
+  fixed-window дали бы всплеск 2×`limit` в узком интервале на стыке; sliding это
+  не допускает — проверяем, что на стыке за любой интервал длины `window`
+  разрешено не более `limit`. Плюс: заполнение окна до `limit` затем денай;
+  освобождение по мере «выезда» старых запросов из окна (через `Advance`).
+
+**Готово:** тест границы окна зелёный под `-race`; выбранный вариант зафиксирован
+в этом разделе.
 
 ### Этап 3 — Leaky bucket
-`LeakyBucket` (leak-as-a-meter). Тесты: сглаживание всплеска в постоянный отток,
-переполнение при полном бакете. **Готово:** тесты steady-state и переполнения
-зелёные.
+Реализация — в `internal/limiter/leakybucket.go` (заменить заглушку, assertion
+сохранить). Тип `LeakyBucket`, конструктор
+`NewLeakyBucket(rate float64, capacity int, clk Clock) *LeakyBucket` (`rate` —
+скорость слива единиц/сек, `capacity` — размер очереди; `Clock` последним).
+
+- **leak-as-a-meter (без фоновой горутины).** Поля: уровень воды `float64`,
+  метка времени последнего пересчёта, `rate`/`capacity`, `clk`, `sync.Mutex`.
+  В `AllowN` под мьютексом: слить `elapsed.Seconds()*rate` (кламп по 0 снизу),
+  обновить метку; принять батч из `n`, если `level + n <= capacity` (тогда
+  `level += n`, `true`), иначе `false`. Семантика `n <= 0` — как в §3.
+- **Тесты** (`internal/limiter/leakybucket_test.go`): steady-state — при подаче
+  ровно на скорости слива приём стабилен; всплеск сверх `capacity` при полном
+  бакете денаится (переполнение); после `Advance` уровень падает и снова есть
+  место.
+
+**Готово:** тесты steady-state и переполнения зелёные под `-race`.
 
 ### Этап 4 — Lock-free token bucket + stress-тесты гонок
-`LockFreeTokenBucket` на `sync/atomic` (CAS-цикл, упакованное состояние).
-**Stress-тест на гонки** — центральный артефакт этапа: N горутин параллельно
-вызывают `Allow`, счётчик разрешённых атомарный; проверяем **суммарно
-пропущенных ≤ теоретического лимита** за окно. Весь пакет — обязательно под
-`go test -race`, желательно с `-count` и `GOMAXPROCS>1`. Опционально — быстрый
-контроль корректности через `testing/quick`. **Готово:** stress-тест стабильно
-зелёный под `-race`, инвариант «≤ лимита» не нарушается.
+**Новый файл** `internal/limiter/lockfree_tokenbucket.go` (в Этапе 0 его нет —
+создать; добавить assertion `var _ Limiter = (*LockFreeTokenBucket)(nil)`). Тип
+`LockFreeTokenBucket`, конструктор
+`NewLockFreeTokenBucket(rate float64, capacity int, clk Clock) *LockFreeTokenBucket`
+(сигнатура совпадает с `NewTokenBucket`, чтобы бенчмарки Этапа 5 гоняли оба по
+одному паттерну).
+
+- CAS-цикл на `sync/atomic` (SKILL §5): `read state → computeNext(state, now) →
+  CompareAndSwap → retry`. `computeNext` — **чистая** функция (refill + попытка
+  списать `n`), весь недетерминизм только в петле.
+- **Открытое решение (за автором):** упаковка состояния (токены+метка времени) —
+  `atomic.Pointer[state]` на неизменяемый снапшот **или** битовые поля в одном
+  `uint64`. Плюсы/минусы зафиксировать при реализации; SKILL §5 намеренно
+  оставляет выбор и не предписывает стратегию backoff при неудачном CAS.
+- **Stress-тест на гонки** (`internal/limiter/lockfree_tokenbucket_test.go`) —
+  центральный артефакт этапа: заморозить время (fake-clock, refill=0), N горутин
+  параллельно бьют `Allow`, атомарный счётчик разрешённых; инвариант — **суммарно
+  разрешённых ≤ `capacity`** (превышение = гонка/потерянное обновление). Паттерн —
+  SKILL §4. Весь пакет — обязательно под `go test -race`, с `-count>1` и
+  `GOMAXPROCS>1`. Опционально — property через `testing/quick`.
+
+**Готово:** stress-тест стабильно зелёный под `-race` (`-count`, `GOMAXPROCS>1`),
+инвариант «≤ `capacity`» не нарушается.
 
 ### Этап 5 — Бенчмарк-сьют + сравнительный отчёт
-`testing.B`-микробенчмарки на каждый лимитер (`b.RunParallel` для конкурентного
-профиля). CLI `cmd/bench`: флаги `-algo`, `-goroutines`, `-rate`, `-duration`;
-драйвер нагрузки; рендер сравнительной таблицы throughput/latency. README
-дополняется реальными результатами (mutex vs lock-free — что дал CAS и чего
-стоил). **Готово:** `go test -bench` и `cmd/bench` дают воспроизводимую таблицу,
-README обновлён.
+Микробенчмарки — в `internal/limiter/*_bench_test.go` (по SKILL §6, один паттерн
+на все лимитеры: `b.RunParallel`, большая ёмкость → меряем механику, а не отказы).
+CLI — заменить заглушку `cmd/bench/main.go` (тонкий харнесс, вся логика лимитеров
+из `internal/limiter`, в `main` только оркестрация — TECHNICAL_PLAN §2).
+
+- **Флаги `cmd/bench`:** `-algo` (token|sliding|leaky|lockfree), `-goroutines`,
+  `-rate`, `-duration`. Драйвер: N горутин бьют выбранный лимитер в течение
+  `-duration`, собираем throughput (allowed/сек) и latency; рендер сравнительной
+  таблицы. **Открытое решение (за автором):** формат таблицы и набор метрик
+  latency (среднее vs перцентили — p50/p99 отмечены как post-MVP в
+  `POST_MVP_PLAN.md §4`).
+- README дополняется реальными числами (mutex vs lock-free — что дал CAS и чего
+  стоил).
+
+**Готово:** `go test -bench=. ./internal/limiter/` и `go run ./cmd/bench` дают
+воспроизводимую таблицу; README обновлён реальными результатами.
 
 ## 7. Тестирование (сводка; детали — SKILL.md §4)
 
