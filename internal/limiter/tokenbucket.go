@@ -17,6 +17,9 @@ import (
 // against it to show what lock-free buys and what it costs in complexity.
 //
 // TokenBucket is safe for concurrent use by multiple goroutines.
+//
+// The zero value is not usable: it carries no Clock, so the first Allow call
+// panics with a nil pointer dereference. Construct with NewTokenBucket.
 type TokenBucket struct {
 	mu sync.Mutex
 
