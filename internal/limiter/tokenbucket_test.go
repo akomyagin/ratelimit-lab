@@ -2,6 +2,7 @@ package limiter
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -165,29 +166,24 @@ func TestTokenBucket_ConcurrentNoOverAdmit(t *testing.T) {
 	clk := &fakeClock{now: time.Unix(0, 0)}
 	b := NewTokenBucket(1, capacity, clk)
 
-	var mu sync.Mutex
-	allowed := 0
+	var admitted atomic.Int64
 
 	var wg sync.WaitGroup
+	wg.Add(goroutines)
 	for i := 0; i < goroutines; i++ {
-		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			local := 0
 			for j := 0; j < callsPer; j++ {
 				if b.Allow() {
-					local++
+					admitted.Add(1)
 				}
 			}
-			mu.Lock()
-			allowed += local
-			mu.Unlock()
 		}()
 	}
 	wg.Wait()
 
-	if allowed != capacity {
-		t.Fatalf("admitted %d requests, want exactly %d (time frozen, no refill)", allowed, capacity)
+	if got := admitted.Load(); got != capacity {
+		t.Fatalf("admitted %d requests, want exactly %d (time frozen, no refill)", got, capacity)
 	}
 }
 
