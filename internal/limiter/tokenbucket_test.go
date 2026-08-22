@@ -190,3 +190,39 @@ func TestTokenBucket_ConcurrentNoOverAdmit(t *testing.T) {
 		t.Fatalf("admitted %d requests, want exactly %d (time frozen, no refill)", allowed, capacity)
 	}
 }
+
+// TestTokenBucket_SteadyStateNonBinaryExactStep is the regression test for
+// float64 drift in the spend comparison, mirroring the leaky-bucket case.
+// The scenario table above only uses binary-exact rate/step combinations, so
+// it passes with or without admitEpsilon.
+//
+// Here 0.1 has no exact float64 representation: refilling a whole token as ten
+// 100ms credits lands ~1.4e-16 short of 1.0, and a strict `tokens >= n` then
+// denies every boundary request. Measured before the fix: 910 admissions out
+// of the 1000 that are arithmetically due, i.e. ~9% under the configured rate.
+func TestTokenBucket_SteadyStateNonBinaryExactStep(t *testing.T) {
+	const (
+		steps = 10000                  // 1000s of simulated time
+		step  = 100 * time.Millisecond // rate*step == 0.1 tokens, not binary-exact
+		want  = steps / 10             // one token accrues every ten steps
+	)
+
+	clk := &fakeClock{now: time.Unix(0, 0)}
+	b := NewTokenBucket(1, 1, clk)
+
+	allowed := 0
+	for i := 0; i < steps; i++ {
+		clk.Advance(step)
+		if b.Allow() {
+			allowed++
+		}
+	}
+
+	// The bucket starts full, but that initial token is not an extra admission:
+	// the first step's refill is clamped away by the capacity cap, so the token
+	// it would have accrued is simply spent on call 1 instead of call 11.
+	if allowed != want {
+		t.Fatalf("admitted %d requests over %v, want exactly %d (client calls at exactly the refill rate); float drift in the spend comparison?",
+			allowed, time.Duration(steps)*step, want)
+	}
+}

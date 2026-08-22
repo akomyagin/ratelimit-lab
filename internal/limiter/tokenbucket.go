@@ -51,6 +51,11 @@ func (b *TokenBucket) Allow() bool { return b.AllowN(1) }
 // fewer than n tokens are available, nothing is consumed and AllowN returns
 // false. For n <= 0 it returns true without touching any state (not even the
 // refill timestamp), per the Limiter port contract.
+//
+// The spend comparison carries admitEpsilon because `tokens` accrues as a
+// float64 across many partial refills: without it, a client calling at exactly
+// the configured rate is denied on every boundary request (see admitEpsilon in
+// limiter.go).
 func (b *TokenBucket) AllowN(n int) bool {
 	if n <= 0 {
 		return true
@@ -64,7 +69,7 @@ func (b *TokenBucket) AllowN(n int) bool {
 	b.tokens = min(b.capacity, b.tokens+elapsed.Seconds()*b.rate)
 	b.last = now
 
-	if b.tokens >= float64(n) {
+	if b.tokens+admitEpsilon >= float64(n) {
 		b.tokens -= float64(n)
 		return true
 	}
