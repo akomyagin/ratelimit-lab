@@ -1,6 +1,7 @@
 package limiter
 
 import (
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -270,22 +271,49 @@ func TestLeakyBucket_ConcurrentWithLeak(t *testing.T) {
 		}()
 	}
 
-	// Drive the clock forward alongside the workers so the drain arithmetic
-	// runs concurrently with admission decisions instead of only ever
-	// single-threaded.
-	for i := 0; i < ticks; i++ {
-		clk.Advance(tick)
-	}
+	// Drive the clock from its own goroutine, interleaved with the workers, so
+	// the drain arithmetic actually runs concurrently with admission decisions.
+	// Ticking inline here instead would race the workers to finish and usually
+	// win, leaving the leak path exercised single-threaded after all.
+	done := make(chan struct{})
+	var driver sync.WaitGroup
+	driver.Add(1)
+	go func() {
+		defer driver.Done()
+		for i := 0; i < ticks; i++ {
+			clk.Advance(tick)
+			select {
+			case <-done:
+				// Workers finished early: burn the remaining ticks at once so
+				// the elapsed time in the bound below stays exact.
+				for j := i + 1; j < ticks; j++ {
+					clk.Advance(tick)
+				}
+				return
+			default:
+			}
+			runtime.Gosched()
+		}
+	}()
 
 	wg.Wait()
+	close(done)
+	driver.Wait()
 
 	// Upper bound, not an exact count: the interleaving of Advance and Allow is
 	// nondeterministic, but no schedule can admit more than a full bucket plus
 	// whatever drained away over the total elapsed time.
 	elapsed := time.Duration(ticks) * tick
 	bound := int64(capacity + rate*elapsed.Seconds())
-	if got := admitted.Load(); got > bound {
+	got := admitted.Load()
+	if got > bound {
 		t.Fatalf("admitted %d requests, want <= %d (capacity %d plus %v of leak at %v/s)", got, bound, capacity, elapsed, rate)
+	}
+	// Lower bound too, or a limiter that denies everything would pass: the
+	// bucket starts empty and there are far more calls than capacity, so at
+	// least a full bucket's worth must get through under any schedule.
+	if got < capacity {
+		t.Fatalf("admitted %d requests, want >= %d (an initially empty bucket must admit at least its capacity)", got, capacity)
 	}
 }
 

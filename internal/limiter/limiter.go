@@ -21,7 +21,16 @@ import "time"
 //
 // 1e-9 is far above the accumulated drift (~1e-16 per unit) and far below any
 // meaningful fraction of a request, so it fixes the boundary without loosening
-// the limit in any way an observer could notice.
+// the limit in any way an observer could notice: the debt an admission can run
+// up is bounded by one epsilon for the lifetime of the limiter, not per call.
+//
+// The absolute constant stops working once the limit reaches 2^24 (16777216):
+// float64 spacing there is 3.7e-9, so `capacity+admitEpsilon == capacity` and
+// the epsilon silently becomes a no-op, restoring the boundary denials it was
+// added to prevent. That is accepted rather than fixed with a relative epsilon —
+// the limits in this project count requests, and 16M concurrent requests is not
+// a configuration worth complicating the arithmetic for. Revisit if a limiter is
+// ever used to meter bytes.
 const admitEpsilon = 1e-9
 
 // Limiter is the common contract shared by every rate-limiting algorithm in
