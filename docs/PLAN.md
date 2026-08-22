@@ -59,8 +59,12 @@ internal/limiter/         # ядро-библиотека (Limiter + реали�
 ├── tokenbucket.go        # mutex-based token bucket (baseline)
 ├── slidingwindow.go      # sliding window
 ├── leakybucket.go        # leaky bucket (leak-as-a-meter)
-└── lockfree_tokenbucket.go # CAS-based lock-free token bucket (Этап 4)
-cmd/bench/main.go         # CLI-харнесс: нагрузка + сравнительный отчёт
+├── lockfree_tokenbucket.go # CAS-based lock-free token bucket (Этап 4)
+└── limiter_bench_test.go # микробенчмарки Serial/Parallel × 4 алгоритма (Этап 5)
+cmd/bench/                # CLI-харнесс: нагрузка + сравнительный отчёт (Этап 5)
+├── main.go               # флаги, валидация, отображение -algo → конструктор
+├── runner.go             # драйвер нагрузки и сбор метрик
+└── report.go             # гистограмма перцентилей + рендереры text/markdown
 ```
 
 Один общий контракт `Limiter` за портом; каждый алгоритм — отдельный файл-адаптер.

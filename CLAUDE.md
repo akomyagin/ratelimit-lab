@@ -19,12 +19,12 @@ based lock-free token bucket, сравнение throughput/latency под ко�
 
 ## Структура репозитория
 
-Текущее состояние (Этапы 0–4 смержены): реализованы `limiter.go` (порт
+Текущее состояние (Этапы 0–5): реализованы `limiter.go` (порт
 `Limiter` + `Clock` + `SystemClock` + `admitEpsilon`), `tokenbucket.go`,
 `slidingwindow.go`, `leakybucket.go` и `lockfree_tokenbucket.go` — все с
-тестами; `cmd/bench/main.go` остаётся **заглушкой** (`panic`/`TODO(Этап 5)`).
-Столбец «Содержимое» ниже описывает целевое назначение файла и этап
-реализации.
+тестами. Заглушек больше нет: Этап 5 заменил `cmd/bench/main.go` рабочим
+харнессом (плюс `runner.go`/`report.go` в том же `package main`) и добавил
+микробенчмарки `internal/limiter/limiter_bench_test.go`.
 
 Про lock-free реализацию полезно знать до чтения кода: состояние упаковано в
 `atomic.Pointer` на неизменяемый снапшот (не битовыми полями в `uint64`), а
@@ -50,7 +50,10 @@ mutex-версией, которая персистит refill и на отка�
 | `internal/limiter/slidingwindow.go` | Sliding window (Этап 2) |
 | `internal/limiter/leakybucket.go` | Leaky bucket (Этап 3) |
 | `internal/limiter/lockfree_tokenbucket.go` | CAS-based lock-free token bucket (Этап 4) |
-| `cmd/bench/main.go` | Тонкий CLI-харнесс: нагрузка + сравнительный отчёт (Этап 5) |
+| `internal/limiter/limiter_bench_test.go` | Микробенчмарки: Serial/Parallel × 4 алгоритма через общие хелперы (Этап 5) |
+| `cmd/bench/main.go` | Флаги, валидация, отображение `-algo` → конструктор (Этап 5) |
+| `cmd/bench/runner.go` | Драйвер нагрузки: N горутин, стоп по времени, сбор метрик (Этап 5) |
+| `cmd/bench/report.go` | Гистограмма перцентилей + рендереры `text`/`markdown` (Этап 5) |
 
 `pkg/` намеренно нет — всё ядро в `internal/` (импорт извне запрещён компилятором;
 обоснование — `TECHNICAL_PLAN.md §2`). **Docker/Compose нет и не планируется**
@@ -69,7 +72,16 @@ mutex-версией, которая персистит refill и на отка�
 - **Только стандартная библиотека.** Внешние модули не добавляем без веской
   причины — учебная цель в том, чтобы понять примитивы, а не собрать зависимости.
 - **Заглушки Этапа 0 помечены `TODO(Этап N)`** — при реализации заменяем
-  содержимое файла, не плодим параллельные `*_v2.go`.
+  содержимое файла, не плодим параллельные `*_v2.go`. На Этапе 5 последняя
+  заглушка снята; правило остаётся на будущие этапы.
+- **Бенчмарки меряют только путь допуска, и это осознанно.** `rate`/`capacity`
+  по умолчанию заведомо выше нагрузки, потому что на непустом бакете сравнение
+  mutex против CAS осмысленно, а на пустом — нет: lock-free возвращает `false`
+  без CAS и без аллокации, mutex-версии и на отказе берут блокировку. Разрыв
+  измерим: `go run ./cmd/bench -rate=1000 -capacity=1` даёт lock-free ~27×
+  «преимущества», целиком созданного дешёвым путём отказа. Поэтому `cmd/bench`
+  печатает warning-строку, как только в любой строке `denied > 0` — цифры там
+  сравнивать нельзя. Не «чинить» это подкруткой конфигурации.
 
 ## Команды
 
@@ -79,8 +91,10 @@ go build ./...
 go vet ./...
 go test ./...
 go test -race ./...                    # ОБЯЗАТЕЛЬНО перед коммитом кода этапов 1+
-go test -bench=. ./internal/limiter/   # бенчмарки (появятся в Этапе 5)
-go run ./cmd/bench                      # CLI-харнесс (реализация — Этап 5)
+go test -bench=. -benchmem ./internal/limiter/   # микробенчмарки (-benchmem обязателен: allocs/op — результат Этапа 5)
+go run ./cmd/bench                              # сравнительная таблица по всем 4 алгоритмам, ~8с
+go run ./cmd/bench -format=markdown             # та же таблица готовой GFM-таблицей для README
+go run ./cmd/bench -percentiles                 # + p50/p99/p99.9 (ценой per-call time.Now())
 ```
 
 Перед коммитом кода: `go build ./... && go vet ./... && go test -race ./...`
