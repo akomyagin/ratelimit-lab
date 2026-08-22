@@ -5,11 +5,6 @@ import (
 	"time"
 )
 
-// admitEpsilon absorbs float64 rounding error in the admission comparison so
-// that exact boundary cases (e.g. estimate arithmetically equal to the limit)
-// are not spuriously denied by a few ULPs of drift.
-const admitEpsilon = 1e-9
-
 // SlidingWindow is a mutex-guarded weighted sliding-window-counter rate
 // limiter: it admits at most `limit` requests within any trailing `window`
 // duration, avoiding the burst-at-boundary flaw of a naive fixed-window

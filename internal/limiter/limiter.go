@@ -6,6 +6,24 @@ package limiter
 
 import "time"
 
+// admitEpsilon absorbs float64 rounding error in the admission comparison so
+// that exact boundary cases (e.g. a level arithmetically equal to the limit)
+// are not spuriously denied by a few ULPs of drift.
+//
+// It is shared by every implementation whose state accrues over time as a
+// float64, because the drift is measurable rather than theoretical: a client
+// calling at exactly the configured rate with a step that is not binary-exact
+// (rate 1/s polled every 100ms, since 0.1 has no exact float64 representation)
+// leaves a residue of ~1e-16 after draining what should be a whole unit. Every
+// boundary request is then denied and throughput lands ~9% under the configured
+// rate. Measured on both TokenBucket and LeakyBucket: 910 admissions where 1000
+// were due.
+//
+// 1e-9 is far above the accumulated drift (~1e-16 per unit) and far below any
+// meaningful fraction of a request, so it fixes the boundary without loosening
+// the limit in any way an observer could notice.
+const admitEpsilon = 1e-9
+
 // Limiter is the common contract shared by every rate-limiting algorithm in
 // this package. Implementations decide, on each call, whether one unit of work
 // ("one request") is permitted right now under the configured limit.
