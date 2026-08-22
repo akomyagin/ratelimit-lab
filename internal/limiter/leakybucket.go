@@ -19,6 +19,9 @@ import (
 // at the leak rate and bursts are smoothed into a constant outflow.
 //
 // LeakyBucket is safe for concurrent use by multiple goroutines.
+//
+// The zero value is not usable: it carries no Clock, so the first Allow call
+// panics with a nil pointer dereference. Construct with NewLeakyBucket.
 type LeakyBucket struct {
 	mu sync.Mutex
 
