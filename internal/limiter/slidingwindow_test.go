@@ -177,29 +177,24 @@ func TestSlidingWindow_ConcurrentNoOverAdmit(t *testing.T) {
 	clk := &fakeClock{now: time.Unix(0, 0)}
 	w := NewSlidingWindow(limit, time.Second, clk)
 
-	var mu sync.Mutex
-	allowed := 0
+	var admitted atomic.Int64
 
 	var wg sync.WaitGroup
+	wg.Add(goroutines)
 	for i := 0; i < goroutines; i++ {
-		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			local := 0
 			for j := 0; j < callsPer; j++ {
 				if w.Allow() {
-					local++
+					admitted.Add(1)
 				}
 			}
-			mu.Lock()
-			allowed += local
-			mu.Unlock()
 		}()
 	}
 	wg.Wait()
 
-	if allowed != limit {
-		t.Fatalf("admitted %d requests, want exactly %d (time frozen inside one window)", allowed, limit)
+	if got := admitted.Load(); got != limit {
+		t.Fatalf("admitted %d requests, want exactly %d (time frozen inside one window)", got, limit)
 	}
 }
 
