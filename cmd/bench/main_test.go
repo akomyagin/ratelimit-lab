@@ -134,6 +134,38 @@ func TestParseConfigSlidingRateValidation(t *testing.T) {
 	}
 }
 
+// TestParseConfigAtomicBoundsValidation pins the constraints that only apply
+// when -algo includes atomic. NewAtomicTokenBucket panics on a rate needing a
+// sub-nanosecond emission interval, or on a capacity whose bucket span
+// overflows; parseConfig has to catch both first, because a CLI typo must
+// produce a diagnostic and exit 1, never a stack trace.
+func TestParseConfigAtomicBoundsValidation(t *testing.T) {
+	if _, err := parseConfig([]string{"-algo=atomic", "-rate=3e9"}); err == nil {
+		t.Error("parseConfig(-algo=atomic -rate=3e9) = nil error, want rejection (emission interval below 1ns)")
+	}
+
+	if _, err := parseConfig([]string{"-algo=all", "-rate=3e9"}); err == nil {
+		t.Error("parseConfig(-algo=all -rate=3e9) = nil error, want rejection (all includes atomic)")
+	}
+
+	if _, err := parseConfig([]string{"-algo=lockfree", "-rate=3e9"}); err != nil {
+		t.Errorf("parseConfig(-algo=lockfree -rate=3e9) = error %v, want success (atomic-only constraint)", err)
+	}
+
+	// One per hour with a burst of three million: the span overflows.
+	if _, err := parseConfig([]string{"-algo=atomic", "-rate=0.000277777", "-capacity=3000000"}); err == nil {
+		t.Error("parseConfig(-algo=atomic, hourly rate, 3M capacity) = nil error, want rejection (bucket span overflow)")
+	}
+
+	// The defaults, and the boundary rate, must stay valid.
+	if _, err := parseConfig([]string{"-algo=atomic"}); err != nil {
+		t.Errorf("parseConfig(-algo=atomic) = error %v, want success at the defaults", err)
+	}
+	if _, err := parseConfig([]string{"-algo=atomic", "-rate=2e9"}); err != nil {
+		t.Errorf("parseConfig(-algo=atomic -rate=2e9) = error %v, want success (boundary is valid)", err)
+	}
+}
+
 func TestMakeLimiter(t *testing.T) {
 	cfg, err := parseConfig([]string{"-rate=1000", "-capacity=5"})
 	if err != nil {
@@ -148,6 +180,7 @@ func TestMakeLimiter(t *testing.T) {
 		{algoSliding, (*limiter.SlidingWindow)(nil)},
 		{algoLeaky, (*limiter.LeakyBucket)(nil)},
 		{algoLockFree, (*limiter.LockFreeTokenBucket)(nil)},
+		{algoAtomic, (*limiter.AtomicTokenBucket)(nil)},
 	}
 
 	for _, tt := range tests {
@@ -242,7 +275,7 @@ func TestRunWiring(t *testing.T) {
 		{
 			name: "text, all algos",
 			args: []string{"-goroutines=2", "-duration=20ms"},
-			want: []string{algoToken, algoSliding, algoLeaky, algoLockFree, "allocs/op (approx)"},
+			want: []string{algoToken, algoSliding, algoLeaky, algoLockFree, algoAtomic, "allocs/op (approx)"},
 		},
 	}
 

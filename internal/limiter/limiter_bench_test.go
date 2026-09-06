@@ -7,11 +7,12 @@ import (
 
 // Micro-benchmarks for every Limiter implementation (Этап 5).
 //
-// All four algorithms go through the same two helpers, benchSerial and
+// Every algorithm goes through the same two helpers, benchSerial and
 // benchParallel, so the comparison measures the limiters and nothing else: one
 // loop body, one load profile, one level of interface indirection. Splitting
 // the benchmarks per algorithm would duplicate the loop and let the variants
-// drift apart on the first edit.
+// drift apart on the first edit. The Baseline_* benchmarks at the bottom give
+// the floor those numbers sit on.
 //
 // Two setup rules make the numbers mean what they claim:
 //
@@ -21,12 +22,12 @@ import (
 //     fakeClock instead of mutex against CAS. Determinism is a correctness-test
 //     concern, not a measurement one.
 //
-//   - The bucket must never run dry. LockFreeTokenBucket returns false on a
+//   - The bucket must never run dry. Both lock-free variants return false on a
 //     denial without performing a CAS (and without allocating a state
 //     snapshot), while the mutex implementations still take the lock on a
 //     denial. Benchmarking an empty bucket would therefore time the lock-free
 //     fast path against the baseline's full lock acquisition and hand the
-//     lock-free variant an unearned win. Rate and capacity are set far above
+//     lock-free variants an unearned win. Rate and capacity are set far above
 //     anything b.N can consume so that every call takes the admission path.
 //
 // ReportAllocs is mandatory here: the Этап 4 state representation
@@ -101,4 +102,76 @@ func BenchmarkLockFreeTokenBucket_Serial(b *testing.B) {
 
 func BenchmarkLockFreeTokenBucket_Parallel(b *testing.B) {
 	benchParallel(b, NewLockFreeTokenBucket(benchRate, benchCapacity, SystemClock))
+}
+
+// AtomicTokenBucket runs on the same constants as the others, and they all fall
+// well inside its integer bounds: benchRate 1e9 gives an emission interval of
+// exactly 1 ns (no quantization error to explain away), and benchCapacity 1<<30
+// makes the bucket span ~1.07e9 ns, nine orders of magnitude below the limit.
+// It starts full with 2^30 units and accrues 1e9/s against a consumption of
+// roughly 1e7/s, so it never runs dry and every call takes the admission path,
+// as required above. SystemClock implements SinceClock, so this measures the
+// production configuration including the monotonic-only clock read.
+func BenchmarkAtomicTokenBucket_Serial(b *testing.B) {
+	benchSerial(b, NewAtomicTokenBucket(benchRate, benchCapacity, SystemClock))
+}
+
+func BenchmarkAtomicTokenBucket_Parallel(b *testing.B) {
+	benchParallel(b, NewAtomicTokenBucket(benchRate, benchCapacity, SystemClock))
+}
+
+// Baselines: the floor under every number above, and the way to read them.
+//
+// A serial admission decision is dominated by things that are not the limiter.
+// Baseline_NoopLimiter is the loop plus one interface dispatch and nothing else;
+// Baseline_ClockNow and Baseline_ClockSince are the two ways a limiter can ask
+// what time it is. The measured clock cost is a large fraction of the fastest
+// limiter's serial time — around 73 ns for Since against 113 for Now, versus a
+// whole admission in under 100 (RESEARCH §1.5) — so a serial figure read
+// without subtracting this floor mostly describes the clock.
+//
+// Subtract the floor from the serial figures only. Under b.RunParallel the
+// picture inverts: contention dominates, the clock falls to a few percent of
+// the profile, and subtracting a single-threaded floor from a contended number
+// means nothing.
+//
+// Baseline_ClockNow minus Baseline_ClockSince is the price the Clock port used
+// to charge every limiter unconditionally, and what the optional SinceClock
+// extension removes for those that ask for it.
+type noopLimiter struct{}
+
+func (noopLimiter) Allow() bool     { return true }
+func (noopLimiter) AllowN(int) bool { return true }
+
+func BenchmarkBaseline_NoopLimiter_Serial(b *testing.B) { benchSerial(b, noopLimiter{}) }
+
+func BenchmarkBaseline_NoopLimiter_Parallel(b *testing.B) { benchParallel(b, noopLimiter{}) }
+
+// Package-level sinks so the compiler cannot discard the clock reads being
+// timed. They are never read; that is the point.
+var (
+	sinkTime    time.Time
+	sinkElapsed time.Duration
+)
+
+func BenchmarkBaseline_ClockNow(b *testing.B) {
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		sinkTime = SystemClock.Now()
+	}
+}
+
+func BenchmarkBaseline_ClockSince(b *testing.B) {
+	sc, ok := SystemClock.(SinceClock)
+	if !ok {
+		b.Skip("SystemClock does not implement SinceClock")
+	}
+	base := sc.Now()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		sinkElapsed = sc.Since(base)
+	}
 }

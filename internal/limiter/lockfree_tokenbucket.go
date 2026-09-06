@@ -147,7 +147,7 @@ func (b *LockFreeTokenBucket) AllowN(n int) bool {
 // limiter.go).
 func nextLockFreeState(old *lockFreeState, now time.Time, rate, capacity float64, n int) (*lockFreeState, bool) {
 	tokens := min(capacity, old.tokens+now.Sub(old.last).Seconds()*rate)
-	if tokens+admitEpsilon >= float64(n) {
+	if tokens+admitEpsilon(float64(n)) >= float64(n) {
 		return &lockFreeState{tokens: tokens - float64(n), last: now}, true
 	}
 	return nil, false

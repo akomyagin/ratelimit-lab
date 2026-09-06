@@ -99,7 +99,7 @@ func (w *SlidingWindow) AllowN(n int) bool {
 	overlap := float64(w.window-elapsed) / float64(w.window)
 	estimate := w.prevCount*overlap + w.currCount
 
-	if estimate+float64(n) <= float64(w.limit)+admitEpsilon {
+	if estimate+float64(n) <= float64(w.limit)+admitEpsilon(float64(w.limit)) {
 		w.currCount += float64(n)
 		return true
 	}

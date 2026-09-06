@@ -93,7 +93,7 @@ func (b *LeakyBucket) AllowN(n int) bool {
 	}
 	b.last = now
 
-	if b.level+float64(n) <= b.capacity+admitEpsilon {
+	if b.level+float64(n) <= b.capacity+admitEpsilon(b.capacity) {
 		b.level += float64(n)
 		return true
 	}
