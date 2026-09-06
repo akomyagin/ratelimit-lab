@@ -193,6 +193,55 @@ Rate Algorithm, происхождение — ATM Forum / ITU-T I.371) хран
 аллокацией на итерацию был заменён на `atomicInt64Limiter` с состоянием в одном
 `int64` и сделан дефолтным.
 
+### 2.1 Envoy: в одно слово укладывается и сам token bucket — **[проверено]**
+
+Проверено чтением `source/common/common/token_bucket_impl.h` (ветка `main`).
+Это важнее GCRA-находки, потому что снимает возражение «GCRA — другой
+алгоритм»: здесь **тот же token bucket**, но с переизобретённым представлением
+состояния.
+
+Всё изменяемое состояние `AtomicTokenBucketImpl` — одно поле:
+
+```cpp
+std::atomic<double> time_in_seconds_;   // строка 130
+```
+
+Токены не хранятся, а **выводятся из времени**:
+
+```cpp
+const double time_now = timeNowInSeconds();          // ← ОДИН раз, до петли
+double time_old = time_in_seconds_.load(std::memory_order_relaxed);
+do {
+  const double total_tokens = std::min(max_tokens_, (time_now - time_old) * fill_rate_);
+  if (consumed = cb(total_tokens); consumed == 0) {
+    return 0;                                        // ← отказ БЕЗ CAS
+  }
+  const double total_tokens_new = total_tokens - consumed;
+  time_new = time_now - (total_tokens_new / fill_rate_);
+} while (!time_in_seconds_.compare_exchange_weak(time_old, time_new,
+                                                 std::memory_order_relaxed));
+```
+
+Хранится «виртуальное время», удалённость которого от `now` кодирует запас
+токенов — двойственная запись к TAT у GCRA.
+
+Три следствия для проекта, все проверенные:
+
+1. **Возражение doc-комментария `lockfree_tokenbucket.go` не работает.** Там
+   сказано, что упаковка в `uint64` «заставила бы перейти к fixed-point токенам
+   и усечённой метке времени, то есть к другой арифметике». Это верно для
+   упаковки **пары** `{tokens, last}` — но пару хранить не обязательно.
+   Арифметика здесь остаётся в `double`. В Go переносится как `atomic.Uint64`
+   плюс `math.Float64bits`/`Float64frombits` (готового `atomic.Float64` в
+   stdlib нет).
+2. **Чтение часов вынесено до петли** — независимое подтверждение §1.3.
+3. **Отказ возвращается без CAS** — независимое подтверждение нашего решения
+   Этапа 4, причём в чужой промышленной реализации.
+
+Отдельно к сведению: Envoy пользуется `memory_order_relaxed`, которого в Go
+нет — `sync/atomic` даёт только последовательную согласованность. Значит
+дословный перенос будет несколько дороже оригинала.
+
 ---
 
 ## 3. Находки, меняющие трактовку существующих решений проекта
