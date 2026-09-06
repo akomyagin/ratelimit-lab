@@ -1,9 +1,10 @@
 # B4 — облака, SaaS и публичные API
 
-> Статус: **черновик, в работе.** Файл наполняется по ходу исследования.
-> Каждое утверждение сопровождается ссылкой на официальную документацию или
-> первоисточник. Где проверить не удалось — стоит пометка «**не проверено**».
-> Даты обращения указаны у разделов: документация облаков меняется.
+> Статус: **готово** (по всем разделам структуры). Каждое утверждение
+> сопровождается ссылкой на официальную документацию или первоисточник. Где
+> проверить не удалось — стоит пометка «**не проверено**», и число/имя заголовка
+> тогда НЕ приводится. Все обращения — **6 сентября 2026**; документация облаков
+> меняется, при перепроверке сверяться с датой.
 
 Тема: какие алгоритмы и **какая наблюдаемая семантика** заявлены у облачных
 gateway/WAF и у публичных API — что именно возвращается вызывающему за
@@ -178,6 +179,92 @@ aggregation instance, which AWS WAF counts and rate-limits individually». Ли�
 Интроспекция: «you can retrieve the list of IP addresses that AWS WAF is currently
 rate limiting for a rule through the API call `GetRateBasedStatementManagedKeys`»
 — только для агрегации по IP/forwarded IP.
+
+### Ретраи, backoff и джиттер — token bucket на клиенте
+
+Каноническая статья AWS — «Timeouts, retries, and backoff with jitter»
+(<https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/>).
+**Оговорка о проверяемости:** `aws.amazon.com` в этой сессии стабильно не
+отвечал (ETIMEDOUT/curl rc=28 при трёх попытках), поэтому цитаты из самой статьи
+здесь **не приводятся**. Ссылка на неё как на рекомендуемое чтение стоит в самой
+документации EC2 API throttling
+(<https://docs.aws.amazon.com/ec2/latest/devguide/ec2-api-throttling.html>), где
+рекомендация сформулирована так:
+
+> When you need to poll or retry an API request, we recommend using an exponential
+> backoff algorithm to calculate the sleep interval between API requests. […] You
+> should implement a maximum delay interval, as well as a maximum number of
+> retries. You can also use **jitter (randomized delay) to prevent successive
+> collisions**.
+
+Дальше — по **читаемому** официальному источнику: AWS SDKs and Tools Reference
+Guide, «Retry behavior»
+(<https://docs.aws.amazon.com/sdkref/latest/guide/feature-retry-behavior.html>,
+обращение 06.09.2026; страница описывает новое поведение, включаемое
+`AWS_NEW_RETRIES_2026=true`). Это ровно то, о чём просили: **token bucket,
+применённый к ретраям, а не к запросам**.
+
+**Формула backoff — дословно:**
+
+```
+delay = random(0, 1) × min(20,000 ms, base_delay × 2^retry)
+```
+
+Базовая задержка зависит от **класса ошибки**: 50 ms для transient, **1 000 ms для
+throttling** («The service has rate-limited the request. A longer base delay gives
+time to recover capacity»). Потолок — 20 секунд.
+
+**Зачем джиттер — дословно:**
+
+> The random multiplier is called *full jitter*. Without it, all clients that hit
+> an error at the same time would retry at the same time, creating a burst of retry
+> traffic (the "**thundering herd**" problem). Full jitter spreads retries uniformly
+> across the entire backoff window so the service receives a steady trickle of
+> requests instead of synchronized spikes.
+>
+> For example, suppose 1,000 clients all receive a 503 at the same moment. Full
+> jitter distributes their first retries uniformly across a 50 ms window instead of
+> having all 1,000 retry at exactly 50 ms.
+
+**Retry quota — token bucket с числами:**
+
+> Standard mode includes a **retry quota, a token bucket that deducts tokens for
+> each retry and replenishes tokens when requests succeed**. When the available
+> tokens are exhausted, the SDK returns the error without retrying, so your
+> application **fails fast** instead of waiting through retries that are unlikely to
+> succeed.
+
+| Параметр | Значение (дословно) |
+|---|---|
+| Budget capacity | **500 tokens** |
+| Cost per transient (non-throttling) retry | **14 tokens** |
+| Cost per throttling retry | **5 tokens** |
+| Tokens restored on success after retry | «Amount consumed by the last retry (14 or 5)» |
+| Tokens restored on success without retry | **1 token** |
+
+Порог срабатывания посчитан за нас: «With the default of 3 max attempts, the quota
+begins to drain when more than approximately **22%** of requests result in sustained
+transient failures, or more than approximately **32%** for throttling errors».
+
+**Заметное для нашего проекта.** Этот бакет — не «N запросов в секунду», а
+**отношение успехов к отказам**: пополнение привязано не ко времени, а к событию
+успеха. Времени в модели нет вообще. Наш `Clock`-based `tokenbucket.go` такую
+семантику не выражает: у него refill — функция от `elapsed`, а не от исхода вызова.
+
+Ещё два механизма оттуда же:
+
+- **`x-amz-retry-after` в миллисекундах:** «When this header is present, the SDK
+  uses the server-specified delay, clamped to a minimum of the computed backoff
+  delay and a maximum of the computed backoff delay plus 5,000 ms. **The SDK does
+  not apply jitter to this value, because the service is expected to jitter it.**»
+  То есть ответственность за размазывание толпы явно передаётся серверу — прямое
+  следствие проблемы, названной в IETF-драфте §8.5.
+- **Adaptive mode** — «includes everything in standard mode, plus a **client-side
+  rate limiter**. The rate limiter tracks throttling responses and adjusts the rate
+  at which the SDK sends requests. Unlike standard mode, adaptive mode **can delay
+  or block the *initial* request**». Не рекомендован по умолчанию: «Throttling on
+  one resource causes the rate limiter to slow all requests from that client,
+  including requests to unaffected resources».
 
 ## Google Cloud (Apigee, Cloud Armor)
 
@@ -1273,15 +1360,197 @@ window / sliding window / token bucket) с распределённым счёт
 
 ## Наблюдаемый контракт: что возвращают кроме bool
 
-_в работе_
+Сводка по всей выборке. Столбец «кто» — где именно это подтверждено выше.
+
+| Элемент контракта | Что это | Кто отдаёт |
+|---|---|---|
+| **allowed / success** | сам `bool` | все |
+| **limit** (`q`, `allowed.count`, `X-RateLimit-Limit`, `maximumAvailable`) | сколько всего положено | GitHub, Discord, Atlassian, Azure (`total-calls-header-name`), Apigee, Shopify, Upstash, IETF |
+| **remaining** (`r`, `available.count`, `currentlyAvailable`) | сколько осталось | GitHub, Discord, Atlassian, Azure, Apigee, Shopify, Anthropic, Upstash, IETF |
+| **used** | сколько уже потрачено | GitHub (`x-ratelimit-used`), Apigee (`used.count`) |
+| **reset / retry-after** | когда отпустит | все; форматы расходятся: epoch-секунды (GitHub, Discord), ISO 8601 (Atlassian), RFC 3339 (Anthropic), миллисекунды от эпохи (Upstash `reset`), **относительные секунды** (IETF `t`, `Retry-After`), **миллисекунды задержки** (OpenAI `retry-after-ms`, AWS `x-amz-retry-after`) |
+| **policy / bucket id** | *какой из нескольких* счётчиков сработал | Discord `X-RateLimit-Bucket` + `X-RateLimit-Scope`, GitHub `x-ratelimit-resource`, Atlassian `RateLimit-Reason`, IETF имя политики + `pk`, Apigee `identifier`/`class` |
+| **reason** | почему отказ (не «сколько ждать», а «что произошло») | Atlassian (4 значения), Upstash (`timeout`/`cacheBlock`/`denyList`), IETF problem types (3 типа), Discord (`global` bool) |
+| **cost** | сколько стоил этот вызов | Shopify (`requestedQueryCost`/`actualQueryCost`), GitHub GraphQL (`rateLimit { cost }`), Azure (`tokens-consumed-*`), Cloudflare (score из заголовка origin) |
+| **refill rate / window** | параметры самого лимитера наружу | Shopify (`restoreRate`), IETF (`w` в `RateLimit-Policy`) |
+| **near-limit** | предупреждение до отказа | Atlassian `X-RateLimit-NearLimit` (<20%), Atlassian beta-`r` (присылается только вблизи лимита), Apigee (мотивация flow-переменных: «as it gets close to the quota limit») |
+
+### Что из этого стоило бы добавить в `Limiter` и во что это обойдётся
+
+Текущий порт (`internal/limiter/limiter.go`): `Allow() bool` / `AllowN(n int) bool`,
+неблокирующий, всё-или-ничего.
+
+**Наблюдение по выборке:** ни одна из рассмотренных взрослых систем не
+ограничивается булевым ответом, но **все они — сетевые**, и там метаданные едут в
+заголовках бесплатно относительно RTT. У нас вызов стоит десятки наносекунд, и
+цена наблюдаемости другая: расширенный результат — это лишние поля в возвращаемом
+значении на **каждом** допуске, включая горячий путь бенчмарка.
+
+Ранжирование по отношению «полезность / цена» — от дешёвого к дорогому:
+
+1. **`remaining` + `reset` (или `retryAfter`) без изменения `Allow`.** Отдельный
+   метод `State()` или `Peek()`, а не расширение возвращаемого типа. Цена: у
+   `TokenBucket`/`LeakyBucket` — тривиально (одно чтение под мьютексом); у
+   `LockFreeTokenBucket` — одно атомарное чтение снапшота, без CAS, то есть почти
+   бесплатно. **Оговорка, подтверждённая источниками:** для точного скользящего
+   окна `reset` не определён — Apigee прямо пишет, что `expiry.time` «is not valid»
+   для `rollingwindow`; Upstash пишет, что у sliding window `reset` «do not provide
+   an exact reset time». Значит `slidingwindow.go` может честно отдать `remaining`,
+   но не `reset`. Это не недоделка, а свойство алгоритма — и его надо
+   зафиксировать в doc-комментарии, иначе следующий проход «починит».
+2. **`retryAfter time.Duration` при отказе.** У token bucket считается точно:
+   `(need - tokens) / rate`. У leaky bucket — симметрично. У sliding window — только
+   оценка (см. выше). Наибольшая практическая ценность из всего списка: это
+   единственное поле, которое **меняет поведение вызывающего**, а не только его
+   логи.
+3. **`Reserve`-подобный результат вместо `bool` — не брать.** Ту семантику, ради
+   которой он существует у взрослых («зарезервировать, выполнить, вернуть
+   неиспользованное»), в выборке реализуют Shopify (`requested` → refund
+   `requested - actual`) и Anthropic ITPM («estimated at the beginning […] adjusted
+   during the request»). Она требует **парного вызова** и, значит, состояния между
+   `Allow` и `Commit`. Для нашей цели — сравнение примитивов конкурентности — это
+   меняет предмет измерения: у lock-free версии парный `Commit` вводит второй
+   CAS-цикл, и бенчмарк перестаёт мерять то, что мерил. Если брать — то отдельным
+   типом рядом, а не заменой `Limiter`.
+4. **`cost`/`policy id` — не наше.** Обе вещи имеют смысл только когда лимитеров
+   несколько и они за одним фасадом. У нас один лимитер на вызов; кто отказал —
+   известно из того, какой объект вызвали.
+
+**Отдельно — `AllowN` и байты.** Azure `quota` меряет `bandwidth` в килобайтах,
+IETF draft-11 определяет quota unit `content-bytes`, Cloudflare — score до
+1 000 000. Комментарий к `admitEpsilon` в `limiter.go` прямо говорит: «The absolute
+constant stops working once the limit reaches 2^24 (16777216) […] Revisit if a
+limiter is ever used to meter bytes». **Выборка подтверждает, что «мерить байты» —
+не гипотетический сценарий, а один из трёх стандартизуемых quota units.** Это
+готовый триггер пересмотра, а не абстрактная оговорка.
 
 ## Составные и многомерные лимиты
 
-_в работе_
+**Насколько распространены: это норма, а не исключение.** Ни одна система в
+выборке не ограничивается одним лимитом. Ноль исключений.
+
+| Система | Оси | Как выражено |
+|---|---|---|
+| AWS API Gateway | rate+burst (token bucket) × 4 уровня scope × usage-plan quota (DAY/WEEK/MONTH) | последовательное применение, отказ на любом уровне |
+| AWS EC2 API | **request** token bucket **и** **resource** token bucket на одно действие | «If you exceed a specific bucket limit for an API […] the action of the API is limited even though you have not reached the total API throttle limit» |
+| Apigee | SpikeArrest (секундная шкала) + Quota (часовая/дневная) | разные политики, разные коды (429 против 500) |
+| Cloud Armor | `rate_limit_threshold_count`/`interval_sec` + `ban_threshold_count`/`ban_threshold_interval_sec` + `ban_duration_sec` | двухступенчато: сначала throttle, потом ban |
+| Azure APIM | `rate-limit` (429) + `quota` calls **и** bandwidth (403) + `llm-token-limit` TPM **и** token-quota | «Either `calls`, `bandwidth`, or both together must be specified» |
+| GitHub | primary (час) + secondary points/минуту + content-creation (80/мин и 500/час) + вложенные бюджеты app/PAT | 403 или 429 с разным телом |
+| Discord | per-route + global 50 RPS + invalid-request 10 000 / 10 мин | `X-RateLimit-Scope`: `user` / `global` / `shared` |
+| Atlassian | points/час + burst/сек на эндпоинт + per-issue **20/2 с И 100/30 с** | «three independent rate limiting systems that work simultaneously» |
+| Anthropic | RPM **и** ITPM **и** OTPM + acceleration limits + spend cap | «If you exceed **any** of the rate limits you will get a 429 error describing which rate limit was exceeded» |
+| Shopify | cost/секунду + max cost одного запроса (1000) + ресурсные лимиты (10 000 вариантов/день) | всё в points |
+| IETF draft-11 | список политик в одном заголовке | `RateLimit-Policy: "burst";q=100;w=60,"daily";q=1000;w=86400` |
+
+**Как это выражают — три разных приёма:**
+
+1. **«И» из независимых лимитеров.** Самый частый. Проверяются все, отказ по
+   первому же. Наш порт это выражает без изменений: композитная реализация
+   `Limiter`, которая держит `[]Limiter` и возвращает `false`, если хоть один
+   отказал. **Ловушка, которую надо назвать явно:** «все `Allow()` подряд» — не то
+   же самое, что «все допустили», потому что первые вызовы **уже списали** ёмкость
+   к моменту отказа последнего. Корректная композиция требует либо двухфазности
+   (сначала посмотреть все, потом списать), либо компенсации. Ни один из
+   рассмотренных источников этот момент не оговаривает — они распределённые и
+   мирятся с перерасходом.
+2. **Разные единицы измерения на одном запросе** (RPM+TPM, calls+bandwidth,
+   request-tokens + resource-tokens). Выражается через **разную стоимость одного и
+   того же вызова в разных лимитерах**: `rpm.Allow()` и `tpm.AllowN(tokens)`.
+   Наш `AllowN(n int)` для этого достаточен — но только если `n` известен заранее.
+3. **Стоимость, известная только постфактум.** Здесь единый паттерн у трёх
+   независимых систем: Shopify (requested → refund разницы), Anthropic ITPM
+   (estimate → adjust), Azure APIM (`estimate-prompt-tokens` либо «actual token
+   usage from the response»), Cloudflare (score из заголовка ответа origin). Все
+   четыре честно признают, что при этом лимит **временно превышается**: Azure —
+   «concurrent or near-concurrent requests can temporarily exceed the configured
+   token limit»; Azure APIM `rate-limit-by-key` — «429 […] is returned 1 call later
+   than usual». Это не выражается через `bool`-порт вообще.
 
 ## Поведение при отказе и shadow-режимы
 
-_в работе_
+### Fail-open против fail-closed
+
+Выборка даёт **последовательный перекос в сторону fail-open** — и почти всегда он
+документирован явно, а не подразумевается.
+
+| Система | Что происходит | Цитата/факт |
+|---|---|---|
+| Apigee Quota | **дефолт — fail-open** | `<Synchronous>false</Synchronous>` по умолчанию: «it is possible that some API calls exceeding the quota will go through […] The default asynchronous update interval is 10 seconds» |
+| Azure APIM quota | fail-open при рестарте | «When underlying compute resources restart […] API Management might continue to handle requests for a short period after a quota is reached» |
+| Cloud Armor | fail-open по ключу | отсутствие заголовка/cookie/SNI → «The key type defaults to `ALL`» или к `IP`, а не отказ |
+| Cloudflare complexity-based | fail-open по стоимости | «If the origin server does not provide the HTTP response header with a score value […] the corresponding rate limiting counter **will not be updated**» |
+| AWS WAF | fail-open по времени | «it's possible for requests to be coming in at too high a rate **for up to several minutes** before AWS WAF detects and rate limits them» |
+| AWS WAF | fail-open при реконфигурации | «the change **resets** the rule's rate limiting counts. This can pause the rule's rate limiting activities for up to a minute» |
+| Upstash | fail-open при недоступности хранилища | `reason: "timeout"` — «Is set to `"timeout"` when request times out» |
+| AWS SDK retry quota | **fail-fast**, редкий контрпример | при исчерпании бюджета «the SDK returns the error without retrying, so your application fails fast» — но это отказ **ретраить**, то есть тоже смягчение нагрузки |
+
+Формулировка причины дана прямее всех у Google: «we recommend that you use rate
+limiting **only for abuse mitigation or maintaining application and service
+availability, not for enforcing strict quota or licensing requirements**». И у
+AWS: «applied on a best-effort basis and should be thought of as **targets rather
+than guaranteed request ceilings**».
+
+Fail-closed встречается **только как явно включаемая опция**: Apigee
+`<Synchronous>true</Synchronous>` — «Set to `true` if it is essential that you not
+allow any API calls over the quota», с прямо названной ценой: «there is the
+potential for performance impacts and lower throughputs. In some cases, use of
+`<Synchronous>` could cause the quota policy to **fail to process some
+transactions**».
+
+### Shadow / dry-run режимы — есть у всех четырёх облаков
+
+| Система | Механизм | Подтверждение |
+|---|---|---|
+| AWS WAF | действие **Count** | «AWS WAF counts the request […] and continues the […] evaluation of the request. **This action doesn't limit the rate of requests. It just counts the requests that are over the limit**» |
+| Cloud Armor | **preview mode** | «You can preview the effects of rate limiting rules in a security policy by using preview mode and examining your request logs» |
+| Atlassian | **beta-заголовки** | «Beta headers are **informational only and do not trigger enforcement or throttling**. You can use them now to monitor your usage and prepare for future enforcement.» Включая `Beta-Retry-After: 50` — «indicates how long the app would need to wait **if enforcement were active**» |
+| Cloudflare | «Log mode vs production mode» присутствует в навигации WAF-документации | содержимое страницы в этой сессии не читалось — **не проверено** |
+
+Отдельный подвид «мягкого отказа» — **не отказать, а усложнить**: Cloud Armor
+`exceed_action: redirect` с `type: GOOGLE_RECAPTCHA`; AWS WAF действия
+`CAPTCHA`/`Challenge` — «AWS WAF handles the request either like a Block or like a
+Count, **depending on the state of the request's token**»; Cloudflare для не-Enterprise
+планов — «When visitors pass a challenge, their corresponding request counter is
+**set to zero**».
+
+### «Near limit» — предупреждения до отказа
+
+Подтверждено только у двух:
+
+- **Atlassian**: `X-RateLimit-NearLimit` — «Returns `true` when less than 20% of
+  capacity remains»; и в beta-заголовках `r` присылается **только** когда близко:
+  «Since usage is well below the quota, `r` (remaining) is not included».
+- **Apigee**: мотивация flow-переменных названа прямо — «as it gets close to the
+  quota limit, return the current quota counter to an app».
+
+IETF draft-11 §4.1.1 формулирует это как обязанность клиента, а не сервера: «When
+the available quota is low, it indicates that the server may soon throttle the
+client».
+
+### Что делают при перегрузке (не при превышении лимита)
+
+Здесь Stripe даёт единственную в выборке явную таксономию: **rate limiter решает
+по пользователю, load shedder — по состоянию системы**. Практические следствия
+видны и у других:
+
+- IETF draft-11 определяет отдельный problem type
+  `temporary-reduced-capacity` с 503 и правом сервера отдать «`RateLimit-Policy`
+  field indicating the new temporarily **lower** quota» — то есть лимит
+  **динамически снижается** под нагрузкой;
+- draft-11 §8.3: «In case of resource saturation, the server MAY **artificially
+  lower the returned values** or not serve the request regardless of the advertised
+  quotas»;
+- Shopify: «Shopify may **temporarily reduce API rate limits** to protect platform
+  stability. We will strive to keep these instances brief and rare»;
+- Anthropic: «acceleration limits» — ограничение не уровня, а **скорости роста**
+  нагрузки;
+- Discord: отдельный лимит на **неудачные** запросы (10 000 / 10 минут на 401/403/429),
+  то есть наказание за плохо ведущего себя клиента.
+
+Ни одна из этих семантик не выразима через `Allow() bool` с фиксированными
+`rate`/`capacity`: все они требуют либо изменяемых на лету параметров, либо
+обратной связи от системы.
 
 ## Стандарты заголовков
 
@@ -1421,16 +1690,211 @@ header»), а не из RFC 9110. Формат — либо `HTTP-date`, либ�
 
 ## Сводная таблица
 
-_в работе_
+Алгоритм — только там, где он **назван в официальной документации**; иначе «не
+названо».
+
+| Продукт | Алгоритм (по документации) | Гранулярность окна | Код отказа | Что отдаётся клиенту |
+|---|---|---|---|---|
+| AWS API Gateway | **token bucket** («rate» = refill, «burst» = capacity) | RPS + usage-plan DAY/WEEK/MONTH | 429 | ничего сверх кода |
+| AWS EC2 API | **token bucket**, два бакета (request + resource) | посекундно, refill в т.ч. дробный (0.1/0.15/0.3) | `RequestLimitExceeded` | ничего; лимиты видны в Service Quotas |
+| AWS WAF rate-based | не названо; «estimates […] using an algorithm that gives more importance to more recent requests» | 60/120/300/600 c, проверка ~каждые 10 с | настраиваемое действие (Block/Count/CAPTCHA/Challenge) | `GetRateBasedStatementManagedKeys` (только по IP) |
+| Apigee SpikeArrest | **token bucket** (явно), ёмкость ≈1 + `maxBurstMessageCount` | интервал = период / rate (секунды или мс) | 429 (Private Cloud — 500) | flow-переменная `.failed` |
+| Apigee Quota | fixed / calendar / flexi / **rollingwindow** (точное скользящее окно) | minute…month; `second` только при `Distributed=false` | **500** | 13 flow-переменных (`allowed`/`used`/`available`/`exceed`/`expiry`/`identifier`/`class`) |
+| Cloud Armor | не названо | фиксированный набор `interval_sec` 10…3600 | настраиваемый: 403/404/**429**/502 или redirect | нет; логи + preview mode |
+| Cloudflare Rate Limiting | **sliding window approximation** (формула опубликована) | 10/60/120/300/600/3600 с; счётчик **на дата-центр** | настраиваемое действие + mitigation timeout 0…86400 с | нет стандартных заголовков |
+| Azure APIM `rate-limit` | **classic — sliding window; v2 — token bucket** (обе названы) | `renewal-period` ≤ 300 с | **429** | `Retry-After`, `remaining-calls-*`, `total-calls-*` (имена настраиваются) |
+| Azure APIM `quota` | fixed window | секунды; 0 = бессрочно | **403** + `Retry-After` | `Retry-After` |
+| Azure APIM `llm-token-limit` | (наследует tier) | TPM + Hourly…Yearly | **429** (rate) / **403** (quota) | `remaining-tokens-*`, `remaining-quota-tokens-*`, `tokens-consumed-*`, `retry-after-*` |
+| GitHub REST | не названо | час (primary), минута (secondary) | **403 или 429** | `x-ratelimit-limit/-remaining/-used/-reset/-resource` |
+| GitHub GraphQL | не названо, points | час | 403 или 429 | те же + `rateLimit { limit remaining used resetAt cost }` |
+| Stripe | 4 механизма: request rate / concurrent requests / 2 load shedder'а | — | 429 (limit) / 503 (shed) | — |
+| Shopify | **leaky bucket** (явно), стоимость запроса в points | посекундное восстановление (`restoreRate`) | 429; Storefront checkout — «200 Throttled»; abuse — 430 | `extensions.cost` = `requestedQueryCost`, `actualQueryCost`, `throttleStatus{maximumAvailable, currentlyAvailable, restoreRate}` |
+| Slack | не названо, тарифные полки | минута («1+», «20+», «50+», «100+») | **429** | `Retry-After` |
+| Discord | не названо | per-route + global 50 RPS + invalid 10 000/10 мин | **429** | `X-RateLimit-Limit/-Remaining/-Reset/-Reset-After/-Bucket/-Global/-Scope` + JSON `retry_after` (float) |
+| Atlassian Jira Cloud | burst — **token bucket** (явно); points — не названо | час (points) + секунда (burst) + 2 с и 30 с (per-issue) | **429** | `X-RateLimit-Limit/-Remaining/-Reset/-NearLimit`, `RateLimit-Reason`, `Retry-After` + beta `RateLimit`/`RateLimit-Policy` |
+| OpenAI | не проверено (docs 403) | минута/сутки | **429** | `retry-after`, `retry-after-ms` (подтверждено SDK); `x-ratelimit-*` — **не проверено** |
+| Anthropic | **token bucket** (явно), «capacity is continuously replenished» | минута (RPM/ITPM/OTPM) | **429** | `anthropic-ratelimit-{requests,tokens,input-tokens,output-tokens}-{limit,remaining,reset}`, `retry-after`, `anthropic-workspace-id` |
+| Upstash Ratelimit | fixed window / **sliding window approximation** / token bucket | настраиваемая | — (библиотека) | `{success, limit, remaining, reset, pending, reason}` |
+| IETF draft-11 | алгоритм не предписывается | `w` произвольное | 429 / 503 (через problem types) | `RateLimit-Policy` (`q`,`qu`,`w`,`pk`) + `RateLimit` (`r`,`t`,`pk`) |
 
 ## Применимость к ratelimit-lab
 
-_в работе_
+Проект — учебная single-process библиотека на stdlib, цель — понять примитивы
+конкурентности. Ниже — только то, что действительно применимо, с честной пометкой
+«не тащить».
+
+**1. Наш выбор алгоритмов подтверждён отраслью — все три плюс CAS-вариант «живые».**
+Token bucket назван явно у AWS (API Gateway, EC2), Apigee SpikeArrest, Azure APIM
+v2, Atlassian burst, Anthropic. Leaky bucket — у Shopify, причём именно в варианте
+«счётчик, вытекающий с постоянной скоростью», как у нас. Sliding window — у Azure
+APIM classic, Apigee `rollingwindow` (точный) и Cloudflare/Upstash
+(аппроксимация). Отдельного «модного» четвёртого алгоритма, который мы бы
+пропустили, в выборке нет.
+
+**2. Наша `slidingwindow.go` — точная, а индустрия чаще берёт аппроксимацию, и
+измерила цену.** Cloudflare публикует и формулу, и погрешность на 400 млн запросов:
+0,003 % неверных решений, средняя разница 6 %, **ноль ложных срабатываний**
+(«None of the mitigated sources was below the threshold»). Upstash использует
+**ту же формулу**. Это готовый материал для doc-комментария: наша реализация
+точнее, но это осознанный выбор в пользу «мы в одном процессе, память дешёвая», а
+не незнание альтернативы. Полезно как отдельная строка в README/сравнении.
+
+**3. Дробный refill — не наша вольность, а отраслевая практика.** В таблице EC2
+дробные скорости пополнения (`0.1`, `0.15`, `0.3` токена/с) стоят у боевых
+API-действий. Аргумент в пользу `float64`-арифметики в `tokenbucket.go`, а не
+целочисленных тиков.
+
+**4. `admitEpsilon`: триггер пересмотра — «мерить байты» — подтверждён внешне.**
+Комментарий говорит «Revisit if a limiter is ever used to meter bytes». IETF
+draft-11 определяет quota unit `content-bytes`; Azure APIM `quota` меряет
+`bandwidth` в килобайтах; Cloudflare допускает score до 1 000 000. То есть порог
+2^24 из комментария — не теоретический: килобайты в часовом окне легко его
+достигают. **Формулировку триггера в `limiter.go` можно усилить ссылкой на
+конкретные примеры**, не меняя код.
+
+**5. Что стоит добавить в порт — в порядке убывания отношения польза/цена:**
+   - `retryAfter` при отказе (см. раздел про контракт) — единственное поле,
+     меняющее поведение вызывающего;
+   - `State()`/`Peek()` для `remaining` — дёшево во всех четырёх реализациях;
+   - **и явная фиксация**, что у `SlidingWindow` `reset`/`retryAfter` — оценка, а
+     не точное значение (подтверждено Apigee и Upstash независимо).
+
+**6. Что не тащить — с обоснованием:**
+   - **`Reserve`/`Commit`** (Shopify refund, Anthropic estimate→adjust). Меняет
+     предмет бенчмарка: у `LockFreeTokenBucket` парный `Commit` добавит второй
+     CAS-цикл, и сравнение mutex-против-CAS перестанет мерить то, что мерит сейчас;
+   - **`Acquire`/`Release`** (Stripe concurrent requests limiter). Другой класс
+     примитива — семафор, а не лимитер темпа; в MVP не входит;
+   - **ключи/партиционирование** (`counter-key`, `pk`, `X-RateLimit-Bucket`). Это
+     задача уровня выше — карта `map[key]Limiter`; сам `Limiter` от неё не меняется;
+   - **fail-open при недоступности хранилища** (Upstash `reason: "timeout"`). У нас
+     нет хранилища: состояние в памяти процесса, отказать по инфраструктурной
+     причине нечему.
+
+**7. Наблюдение, прямо относящееся к нашему warning'у про `denied > 0`.** Проект
+уже документирует, что сравнивать mutex и CAS на пустом бакете нельзя, потому что
+lock-free возвращает `false` без CAS. Выборка даёт независимое подтверждение, что
+**путь отказа — отдельный от пути допуска предмет проектирования**, а не побочный
+случай: Cloudflare выносит митигацию в кэшируемый булев флаг («once a mitigation
+has started, we know exactly when it will end […] it will not even run another
+query»); Cloudflare-mitigation timeout и Cloud Armor `ban_duration_sec` делают
+отказ **залипающим**; AWS SDK при исчерпании retry-бюджета отказывает мгновенно и
+без задержки. Наш warning — не костыль, а отражение реальной асимметрии.
+
+**8. Про «двумерные лимиты» — что реально можно сделать в рамках MVP.** Композиция
+`[]Limiter` с разной стоимостью (`rpm.Allow()` + `tpm.AllowN(tokens)`) выражается
+существующим портом без изменений. **Но у неё есть неочевидная ловушка,
+заслуживающая теста, а не только заметки:** последовательные `Allow()` списывают
+ёмкость по мере проверки, поэтому отказ последнего лимитера оставляет первые уже
+списанными. Ни один из рассмотренных источников этого не оговаривает (они
+распределённые и мирятся с перерасходом), но в single-process библиотеке это
+проверяемо и должно быть либо исправлено двухфазностью, либо явно
+задокументировано как поведение.
 
 ## Что рассмотрено и отброшено
 
-_в работе_
+**Разобрано с первоисточниками:** AWS (API Gateway, EC2 API, WAF rate-based rules,
+SDK retry behavior), Google Cloud (Apigee SpikeArrest, Apigee Quota, Cloud Armor),
+Cloudflare (Rate Limiting Rules, request rate calculation, complexity-based,
+инженерный блог про sliding window), Azure API Management (`rate-limit`,
+`rate-limit-by-key`, `quota`, `llm-token-limit`), GitHub (REST + GraphQL), Stripe
+(инженерный блог), Shopify, Slack, Discord, Atlassian Jira Cloud, Anthropic,
+Upstash Ratelimit, IETF `draft-ietf-httpapi-ratelimit-headers` (ревизии -05, -07,
+-08, -11), RFC 6585 §4, RFC 9110 §10.2.3.
+
+**Отброшено или не доведено — с причинами:**
+
+| Что | Почему |
+|---|---|
+| **OpenAI** — точные имена `x-ratelimit-*` и числа по тирам | `platform.openai.com` и `developers.openai.com` отдают **HTTP 403** автоматическим запросам, help-центр тоже. Подтверждено только то, что читается из официальных репозиториев OpenAI (Cookbook, `openai-python`). Числа не приводятся сознательно |
+| **AWS Builders' Library, «Timeouts, retries and backoff with jitter»** | `aws.amazon.com` не отвечал (три попытки, ETIMEDOUT). Тема закрыта через **читаемый** официальный источник — `docs.aws.amazon.com/sdkref` «Retry behavior», который даёт формулу, обоснование джиттера и числа retry-бакета |
+| **Twilio** | обе целевые страницы вернули пустой/нерелевантный документ. Числа и заголовки не приводятся. Тот же класс контракта (per-route + global + reason) лучше покрыт Discord и Atlassian |
+| **Slack — точные значения тиров** | документация даёт «1+ / 20+ / 50+ / 100+ per minute», то есть **нижние границы**, а не точные лимиты. Приведено как есть; точных чисел у Slack просто нет |
+| **Shopify `X-Shopify-Shop-Api-Call-Limit`** | в текущей странице `shopify.dev/docs/api/usage/rate-limits` не найден (REST Admin API выведен из основного потока). Помечено «не проверено» вместо цитирования по памяти |
+| **Cloudflare «Log mode vs production mode»** | страница присутствует в навигации WAF-документации, содержимое не читалось. Помечено «не проверено» |
+| **Unkey, Zuplo** | просмотрены поверхностно; новой семантики контракта сверх `limit`/`remaining`/`reset`/`cost` не обнаружено. Внутренняя арифметика по первоисточникам не проверялась |
+| **AWS WAF — точная формула оценки темпа** | документация говорит только «an algorithm that gives more importance to more recent requests». Формула не публикуется — **не проверено**, EWMA это или иное |
+| **Цены, тарифы, экономика** | вне задачи по постановке проекта (бюджет ≈ $0, монетизация не оценивается). Числа лимитов приводятся только как параметры алгоритмов, а не как коммерческие условия |
+| **Распределённые/кластерные аспекты** (Redis-счётчики, консенсус, репликация) | вне MVP (`single-process only`). Упомянуты только там, где влияют на **наблюдаемую семантику** — например, `UseEffectiveCount` у Apigee и «counters are not shared across data centers» у Cloudflare как иллюстрация «лимит на узел против лимита на систему» |
+
+**Противоречия между источниками, найденные и оставленные как есть:**
+
+- **`Retry-After` и код 429.** RFC 9110 §10.2.3 определяет `Retry-After` только для
+  **503** и **3xx** — 429 там не упоминается. Право слать `Retry-After` с 429 даёт
+  RFC 6585 §4. Оба источника приведены; противоречия по существу нет, но
+  распространённое представление «`Retry-After` определён в RFC 9110 для 429»
+  **неверно**.
+- **Приоритет `Retry-After` против `RateLimit`.** draft-11 §6 (серверу): «the
+  Retry-After field value SHOULD NOT reference a point in time earlier than the end
+  of the effective window»; draft-11 §7 (клиенту): «the Retry-After field MUST take
+  precedence and the effective window MAY be ignored». Формулировки адресованы
+  разным сторонам и не противоречат друг другу, но читать надо обе.
+- **Коды отказа за «превышение квоты» расходятся между вендорами:** Apigee Quota —
+  **500**, Azure APIM `quota` — **403**, Cloud Armor — настраиваемый из
+  {403, 404, 429, 502}, GitHub — **403 или 429**, Shopify Storefront checkout —
+  **200** с ошибкой в теле. Единого «квота исчерпана = 429» в индустрии нет.
 
 ## Источники
 
-_в работе_
+**Стандарты**
+
+- IETF, `draft-ietf-httpapi-ratelimit-headers` (страница документа, статус и список
+  ревизий) — <https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/>
+- draft-11 (текст) — <https://www.ietf.org/archive/id/draft-ietf-httpapi-ratelimit-headers-11.txt>
+- draft-08 — <https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-ratelimit-headers-08>
+- draft-07 — <https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-ratelimit-headers-07>
+- draft-05 — <https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-ratelimit-headers-05>
+- RFC 6585 §4 (429 Too Many Requests) — <https://www.rfc-editor.org/rfc/rfc6585.txt>
+- RFC 9110 §10.2.3 (`Retry-After`) — <https://www.rfc-editor.org/rfc/rfc9110.txt>
+
+**AWS**
+
+- API Gateway request throttling — <https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-request-throttling.html>
+- API Gateway quotas — <https://docs.aws.amazon.com/apigateway/latest/developerguide/limits.html>
+- API Gateway `QuotaSettings` — <https://docs.aws.amazon.com/apigateway/latest/api/API_QuotaSettings.html>
+- EC2 API throttling — <https://docs.aws.amazon.com/ec2/latest/devguide/ec2-api-throttling.html>
+- WAF rate-based rules (обзор) — <https://docs.aws.amazon.com/waf/latest/developerguide/waf-rule-statement-type-rate-based.html>
+- WAF rate-based high-level settings — <https://docs.aws.amazon.com/waf/latest/developerguide/waf-rule-statement-type-rate-based-high-level-settings.html>
+- WAF rate-based caveats — <https://docs.aws.amazon.com/waf/latest/developerguide/waf-rule-statement-type-rate-based-caveats.html>
+- WAF applying rate limiting (действия, включая Count) — <https://docs.aws.amazon.com/waf/latest/developerguide/waf-rule-statement-type-rate-based-request-limiting.html>
+- WAF API `RateBasedStatement` — <https://docs.aws.amazon.com/waf/latest/APIReference/API_RateBasedStatement.html>
+- AWS SDKs and Tools — Retry behavior — <https://docs.aws.amazon.com/sdkref/latest/guide/feature-retry-behavior.html>
+- (не открылось) Builders' Library, Timeouts, retries and backoff with jitter — <https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/>
+
+**Google Cloud**
+
+- Apigee SpikeArrest policy — <https://docs.apigee.com/api-platform/reference/policies/spike-arrest-policy>
+- Apigee Quota policy — <https://docs.apigee.com/api-platform/reference/policies/quota-policy>
+- Cloud Armor rate limiting overview — <https://cloud.google.com/armor/docs/rate-limiting-overview>
+
+**Cloudflare**
+
+- Rate limiting parameters — <https://developers.cloudflare.com/waf/rate-limiting-rules/parameters/>
+- Request rate calculation (+ complexity-based) — <https://developers.cloudflare.com/waf/rate-limiting-rules/request-rate/>
+- Блог: How we built rate limiting capable of scaling to millions of domains — <https://blog.cloudflare.com/counting-things-a-lot-of-different-things/>
+
+**Azure**
+
+- `rate-limit` policy — <https://learn.microsoft.com/en-us/azure/api-management/rate-limit-policy>
+- `rate-limit-by-key` policy — <https://learn.microsoft.com/en-us/azure/api-management/rate-limit-by-key-policy>
+- `quota` policy — <https://learn.microsoft.com/en-us/azure/api-management/quota-policy>
+- `llm-token-limit` policy — <https://learn.microsoft.com/en-us/azure/api-management/llm-token-limit-policy>
+
+**Публичные API**
+
+- GitHub REST rate limits — <https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api>
+- GitHub GraphQL rate limits — <https://docs.github.com/en/graphql/overview/rate-limits-and-node-limits-for-the-graphql-api>
+- Stripe, Scaling your API with rate limiters — <https://stripe.com/blog/rate-limiters>
+- Shopify API rate limits — <https://shopify.dev/docs/api/usage/rate-limits>
+- Slack Web API rate limits — <https://docs.slack.dev/apis/web-api/rate-limits/>
+- Discord rate limits — <https://discord.com/developers/docs/topics/rate-limits>
+- Atlassian Jira Cloud rate limiting — <https://developer.atlassian.com/cloud/jira/platform/rate-limiting/>
+- Anthropic rate limits — <https://docs.anthropic.com/en/api/rate-limits>
+- OpenAI Cookbook, How to handle rate limits — <https://github.com/openai/openai-cookbook/blob/main/examples/How_to_handle_rate_limits.ipynb>
+- `openai-python`, `src/openai/_base_client.py` (обработка `retry-after` / `retry-after-ms`) — <https://github.com/openai/openai-python/blob/main/src/openai/_base_client.py>
+- (403) OpenAI Rate limits guide — <https://developers.openai.com/api/docs/guides/rate-limits>
+
+**Библиотеки**
+
+- Upstash Ratelimit — methods — <https://upstash.com/docs/redis/sdks/ratelimit-ts/methods>
+- Upstash Ratelimit — algorithms — <https://upstash.com/docs/redis/sdks/ratelimit-ts/algorithms>
