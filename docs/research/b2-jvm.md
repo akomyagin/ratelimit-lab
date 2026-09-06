@@ -1,6 +1,5 @@
 # B2 — JVM-экосистема
 
-> Статус: **в работе** (черновик пополняется по ходу исследования).
 > Тема: как JVM-библиотеки rate limiting решают задачи, актуальные для
 > `ratelimit-lab` — CAS на `AtomicReference`, представление состояния,
 > аллокации в петле, множественные лимиты, абстракция часов.
@@ -180,7 +179,7 @@ IEEE_754;
 
 Файл `bucket4j-core/src/main/java/io/github/bucket4j/local/LockFreeBucket.java`.
 Поле — `private final AtomicReference<BucketState> stateRef;`. Канонический вид петли
-(`tryConsumeImpl`, строки ~86–106):
+(`tryConsumeImpl`, строки 85–106):
 
 ```java
 protected boolean tryConsumeImpl(long tokensToConsume) {
@@ -221,7 +220,7 @@ protected boolean tryConsumeImpl(long tokensToConsume) {
 - **Отказ возвращается без CAS.** Ветка `if (tokensToConsume > availableToConsume) return false;` выходит до `compareAndSet`. Это ровно то же решение, что в нашем
   `lockfree_tokenbucket.go`: refill, вычисленный при отказе, не персистится.
   Аллокация `copy()` при этом всё равно уже сделана — в отличие от нашей версии.
-- `estimateAbilityToConsumeImpl` (строки ~124–140) вообще **не содержит петли**: один
+- `estimateAbilityToConsumeImpl` (строки 133–147) вообще **не содержит петли**: один
   `get()`, `copy()`, refill на копии, ответ. Наблюдение без мутации.
 
 Отдельно `getAvailableTokens()` и `getAvailableTokensVerboseImpl()` тоже read-only:
@@ -360,7 +359,7 @@ public final Bucket unlimitedBucket = Bucket.builder()
 > wait until whole `period` will be elapsed before regenerate `tokens`.»
 
 В коде различие — три строки в `refill()`
-(`BucketState64BitsInteger.java:452-455`):
+(`BucketState64BitsInteger.java:453-456`):
 
 ```java
 if (bandwidth.isRefillIntervally()) {
@@ -444,7 +443,7 @@ boolean isWallClockBased();
 > really looks so, but under the hood there is some optimisations that will skip this
 > refresh if `AtomicRateLimiter` is not used actively.
 
-Ядро — `calculateNextState` (строки 226–250):
+Ядро — `calculateNextState` (строки 227–250):
 
 ```java
 long currentNanos = currentNanoTime();
@@ -486,11 +485,11 @@ Burst-семантика другая: `min(nextPermissions + accumulated, permi
 
 ### Аллокации: да, объект `State` создаётся на каждой попытке
 
-Прямой ответ на главный вопрос. Состояние — `private static class State` (строки 421–441),
+Прямой ответ на главный вопрос. Состояние — `private static class State` (строки 441–458),
 неизменяемое, 4 поля: `RateLimiterConfig config`, `long activeCycle`,
 `int activePermissions`, `long nanosToWait`.
 
-Петля (`updateStateWithBackOff`, строки 178–186):
+Петля (`updateStateWithBackOff`, строки 185–193):
 
 ```java
 private State updateStateWithBackOff(final int permits, final long timeoutInNanos) {
@@ -505,7 +504,7 @@ private State updateStateWithBackOff(final int permits, final long timeoutInNano
 ```
 
 `calculateNextState` в конце вызывает `reservePermissions`, который **безусловно**
-завершается конструктором (строки 428–441 → строка ~434):
+завершается конструктором (`reservePermissions`, строка 309):
 
 ```java
 return new State(config, cycle, permissionsWithReservation, nanosToWait);
@@ -528,7 +527,7 @@ return new State(config, cycle, permissionsWithReservation, nanosToWait);
 
 ### Backoff: есть, и со ссылкой на статью
 
-В отличие от Bucket4j, здесь backoff явный (строки 209–215):
+В отличие от Bucket4j, здесь backoff явный (строки 209–215, `compareAndSet` начинается на 209):
 
 ```java
 private boolean compareAndSet(final State current, final State next) {
@@ -540,7 +539,7 @@ private boolean compareAndSet(final State current, final State next) {
 }
 ```
 
-Javadoc метода (строки 170–177 и 188–208) обосновывает:
+Javadoc метода (строки 168–184 и 195–208) обосновывает:
 
 > It differs from `AtomicReference#updateAndGet(UnaryOperator)` by constant back off. It
 > means that after one try to `AtomicReference#compareAndSet(Object, Object)` this method
@@ -605,14 +604,14 @@ Netflix `concurrency-limits` (ниже).
 
 **Метрики** — `Metrics#getNumberOfWaitingThreads()` (счётчик `AtomicInteger waitingThreads`,
 инкрементируется в `waitForPermission`) и `getAvailablePermissions()`. Важная деталь
-реализации `AtomicRateLimiterMetrics` (строки 460–498): метрики считаются как
+реализации `AtomicRateLimiterMetrics` (класс с строки 462): метрики считаются как
 **`calculateNextState(1, -1, currentState)` без публикации результата** — то есть
 чистая функция переиспользована как «что было бы», аналог `estimateAbilityToConsume`
 у Bucket4j. Отдельного кода для метрик нет.
 
 **События** — `RateLimiterEvent.Type`: `SUCCESSFUL_ACQUIRE`, `FAILED_ACQUIRE`, `DRAINED`
 (`event/RateLimiterEvent.java:36-39`). Публикация защищена проверкой
-`if (!eventProcessor.hasConsumers()) return;` (строка 414) — без подписчиков горячий
+`if (!eventProcessor.hasConsumers()) return;` (строка 416) — без подписчиков горячий
 путь не платит ничего.
 
 ### JMH-бенчмарк Resilience4j
@@ -675,7 +674,7 @@ javadoc класса):
 > `acquire(1000)` will result in exactly the same throttling, if any), but it affects the
 > throttling of the *next* request.
 
-Механика — в поле `nextFreeTicketMicros` (`SmoothRateLimiter.java:329`):
+Механика — в поле `nextFreeTicketMicros` (`SmoothRateLimiter.java:330`):
 
 > The time when the next request (no matter its size) will be granted. After granting a
 > request, this is pushed further in the future. Large requests push this further than
@@ -731,7 +730,7 @@ private boolean canAcquire(long nowMicros, long timeoutMicros) {
 
 Формально: `storedPermitsToWaitTime(storedPermits, permitsToTake)` — это интеграл
 кусочно-линейной функции «интервал между разрешениями» по `storedPermits`. В коде эта
-функция нарисована ASCII-графиком (`SmoothRateLimiter.java:143-162`): горизонтальная
+функция нарисована ASCII-графиком (`SmoothRateLimiter.java:144-162`): горизонтальная
 линия на уровне `stableInterval` от 0 до `thresholdPermits`, дальше наклонная вверх до
 `coldInterval = coldFactor * stableInterval` при `maxPermits`. `coldFactor` жёстко
 задан **3.0** в публичной фабрике (`RateLimiter.java:199`); параметризованная перегрузка
@@ -764,7 +763,7 @@ slope = (coldIntervalMicros - stableIntervalMicros) / (maxPermits - thresholdPer
 ### Арифметика: чистый `double`, без эпсилона
 
 `storedPermits`, `maxPermits`, `stableIntervalMicros` — `double`
-(`SmoothRateLimiter.java:314-324`). `nextFreeTicketMicros` — `long`. Никакого
+(`SmoothRateLimiter.java:315-324`). `nextFreeTicketMicros` — `long`. Никакого
 `roundingError`, никакого эпсилона на границе. Причина, почему это сходит с рук:
 **сравнения «хватает ли токенов» в коде нет вообще**. Вместо него —
 `reserveEarliestAvailable`, который считает время:
@@ -1120,7 +1119,7 @@ slope = (coldFactor - 1.0) / count / (maxToken - warningToken);
 Дефолтный `coldFactor` — тоже 3, как у Guava. Есть и `WarmUpRateLimiterController` —
 комбинация warm-up с очередью.
 
-**И вот прямое попадание в тему `admitEpsilon`** (`WarmUpController.canPass`, строка ~124):
+**И вот прямое попадание в тему `admitEpsilon`** (`WarmUpController.canPass`, строка 127):
 
 ```java
 double warningQps = Math.nextUp(1.0 / (aboveToken * slope + 1.0 / count));
@@ -1398,7 +1397,7 @@ while (true) {
 успеха объект больше не переиспользуется — нить выходит из метода.
 
 `copyStateFrom` для целочисленного состояния — `System.arraycopy` в существующий массив
-(`BucketState64BitsInteger.java:298-306`), то есть даже без выделения массива, если
+(`BucketState64BitsInteger.java:298-306`, строка 301), то есть даже без выделения массива, если
 конфигурация та же.
 
 **Прямой перенос в Go есть и он несложный.** Наша петля сейчас:
@@ -1489,12 +1488,199 @@ over benchmark-tuned backoff»). Учитывая, что зрелая библ�
 
 ## Применимость к ratelimit-lab
 
-_(в работе)_
+Рамки, по которым оценивается каждая идея: только stdlib, только single-process,
+приоритет — обучение Go и конкурентности, бюджет ≈ $0. Порт `Limiter`
+(`Allow`/`AllowN`, неблокирующий, всё-или-ничего) считается фиксированным, если явно не
+сказано иначе.
+
+### Берём: высокая ценность, низкая цена
+
+**1. Переиспользуемый буфер снапшота в CAS-петле (приём Bucket4j).**
+Что даёт учебной цели: показывает, что «lock-free = аллокация на итерацию» — не закон, а
+следствие того, что снапшот неизменяем; и что мутировать неопубликованный объект в
+CAS-петле безопасно. Это ровно тот класс рассуждения, ради которого проект и затевался.
+Объём: ~10 строк в `lockfree_tokenbucket.go` плюс правка doc-комментария (строки 36–39
+сейчас утверждают «one small allocation per loop iteration» как неизбежность — это
+станет неверно). Stdlib — да, single-process — да. Прогноз: ~8 alloc/op → 1 на
+parallel-16; вывод «mutex выигрывает» скорее всего устоит, что само по себе результат.
+
+**2. Замерить backoff на неудачном CAS (приём Resilience4j).**
+Что даёт: проверяет гипотезу, отвергнутую сейчас без замера. Doc-комментарий
+`lockfree_tokenbucket.go` (строки ~107–113) объявляет backoff ненужным «без выигрыша в
+корректности» — но вопрос был не про корректность, а про throughput, и зрелая библиотека
+решила иначе со ссылкой на статью. Объём: одна строка `runtime.Gosched()` в ветке
+неудачного CAS + вариант бенчмарка. Stdlib — да. Итог в любом случае идёт в доку: либо
+цифра «стало лучше на X%», либо «замерено, не помогло — вот почему».
+
+**3. Заменить `admitEpsilon` на относительный (`math.Nextafter`) или зафиксировать
+контраст в доке.** Что даёт: снимает задокументированный потолок 2^24 и приводит нас
+к тому же решению, что Sentinel. Объём: одна строка в каждом из трёх мест сравнения
+плюс правка комментария в `limiter.go`. Риск: `Nextafter` — один ULP, а наш `1e-9` — с
+большим запасом; надо проверить, что накопленный дрейф ~1e-16 действительно
+перекрывается одним ULP на реальных величинах (для порога 1.0 ULP ≈ 2.2e-16 — впритык,
+на грани). Осторожная альтернатива: оставить константу, но **дописать в комментарий**,
+что из пяти изученных JVM-библиотек эпсилон применяет одна и в одном месте, а
+остальные меняют представление. Второе — тривиально и полезно само по себе.
+
+**4. Дописать в `cmd/bench` или доку сравнение с чужой методикой.** И Bucket4j
+(`LocalLockFreeState`: `Bandwidth.simple(Long.MAX_VALUE / 2, ...)`), и Resilience4j
+(`limitForPeriod(Integer.MAX_VALUE)`) намеренно делают лимитер неисчерпаемым, чтобы
+мерить только путь допуска. Наше решение из `CLAUDE.md` («бенчмарки меряют только путь
+допуска, и это осознанно») получает внешнее подтверждение — это стоит одной строки со
+ссылкой. Объём — минимальный, ценность — снимает будущий вопрос «а почему у вас так».
+
+### Стоит рассмотреть отдельным этапом
+
+**5. Целочисленное представление токенов как пятая реализация.** Самая содержательная
+идея из всего разбора. Два подварианта:
+
+- **по Pekko**: `tokens int64`, `lastUpdate int64` нанос, и `lastUpdate` двигается только
+  на целое число периодов. Два поля `int64` — **влезает в один `atomic.Uint64`?** нет,
+  два поля не влезут, но влезут в `atomic.Pointer` на 16-байтный снапшот, который
+  в отличие от текущего не содержит `time.Time` (24 байта + указатель на `*Location`);
+- **по Bucket4j**: `tokens int64` + `roundingError int64` + `last int64` — три поля,
+  зато точность не зависит от выбора единицы периода.
+
+Что даёт учебной цели: сразу три вещи — (а) устраняет `admitEpsilon` по построению и
+даёт этому доказательство, а не эмпирику; (б) делает снапшот достаточно компактным,
+чтобы честно сравнить `atomic.Pointer` против упаковки в `atomic.Uint64` — то есть
+доводит до конца эксперимент, который на `float64 + time.Time` был структурно
+невозможен (что и записано в doc-комментарии, строки 27–41); (в) даёт четвёртую точку
+в бенчмарке с честно нулевыми аллокациями. Объём: новый файл ~150 строк + тесты, то есть
+полноценный Этап. Stdlib — да, single-process — да.
+
+**6. `Bandwidth[]` — несколько лимитов на одном лимитере.** Что даёт: показывает, что
+композиция лимитов — это `min` по доступному и списание из всех, а не «два лимитера
+подряд» (последнее некорректно: первый спишет, второй откажет, токен потерян). Это
+неочевидно и хорошо ложится на учебную цель. Объём: значительный — меняется форма
+состояния во всех реализациях, `AllowN` становится циклом, растёт число тестов. Полный
+Этап, не локальная правка. Цена в рантайме по Bucket4j — `O(числа лимитов)` и никаких
+доп. аллокаций.
+
+**7. `estimateAbilityToConsume` — проба без списания.** Что даёт: у Bucket4j это метод
+**без CAS-петли** вообще (один `get()`, refill на копии, ответ) — наглядная
+демонстрация, что read-only наблюдение lock-free структуры бесплатно. У Resilience4j
+та же идея выражена ещё изящнее: метрики считаются вызовом чистой функции перехода
+`calculateNextState(1, -1, currentState)` **без публикации результата** — отдельного
+кода для метрик нет. У нас `nextLockFreeState` уже выделена в чистую функцию, так что
+`Estimate(n int) bool` — это ~5 строк. Расширение порта, но аддитивное.
+
+### Отклоняем для этого проекта
+
+**8. Warm-up (`SmoothWarmingUp`).** Красиво (интеграл кусочно-линейной функции с
+инвариантом аддитивности), но: требует блокирующей семантики или хотя бы возврата
+«сколько ждать», ломает `Allow() bool`; проверяется только тестами на латентность, а не
+на счётчики; и содержательно это про прогрев удалённого ресурса, которого у библиотеки
+нет. Отклонить, но **упомянуть в доке** — это единственная семантика из разбора, которой
+почти нигде больше нет, и знать о ней полезно.
+
+**9. Greedy / intervally как конфигурация.** Различие в коде Bucket4j — три строки
+(округлить «сейчас» вниз до границы периода). Дёшево. Но у нас уже есть три алгоритма с
+разной burst-семантикой, и добавление четвёртой оси конфигурации к каждому размывает
+сравнительную таблицу, ради которой проект и существует. Отклонить как конфигурацию;
+если захочется — реализовать fixed window отдельной реализацией.
+
+**10. Блокирующий и планирующий режимы (`asBlocking` / `asScheduler`).** Оба у Bucket4j
+построены на одном примитиве `reserveAndCalculateTimeToSleep` — красивая экономия. Но в
+Go это `context.Context` в сигнатуре, отмена, и `Clock`, умеющий спать (как
+`SleepingStopwatch` у Guava — иначе тесты блокирующего пути перестают быть
+детерминированными). Это отдельный проект, не расширение. Отклонить.
+
+**11. Адаптивные лимиты (Netflix).** Требуют парного `acquire`/`release` и обратной
+связи о результате запроса. Несовместимо с `Allow() bool` на уровне порта. Отклонить.
+
+**12. `TimeMeter`-подобная замена `Clock`.** Все пять JVM-библиотек передают время
+скаляром (`long` нанос, `Supplier<Long>`, `readMicros()`), никто — структурой. Наш
+`Clock.Now() time.Time` стоит 24 байта на копию и указатель на `*Location`, и именно он
+делает снапшот слишком толстым для упаковки. Соблазн заменить на `Now() int64` есть, но:
+`time.Time` даёт монотонные часы бесплатно и корректно, а самодельный `int64` заставит
+объяснять, откуда он берётся; и это ломающее изменение публичного API ради выигрыша,
+который проявится только вместе с пунктом 5. Отклонить **как отдельное изменение**,
+рассмотреть **внутри** пункта 5 (там снапшот и так меняется).
+
+**13. Гоночный «быстрый путь» (Sentinel `// Contention may exist here, but it's okay.`).**
+Прямо противоречит главному инварианту проекта (`-race` обязателен с Этапа 1). Отклонить
+как реализацию. Но как **бенчмарк-контрпример** в `cmd/bench` — заманчиво: показать
+цену корректности числом. Требует, чтобы гоночный код не попадал под `-race` в CI, что
+само по себе усложнение. Пометить как идею, не как задачу.
 
 ## Что рассмотрено и отброшено
 
-_(в работе)_
+### Рассмотрено по исходному коду (клон репозитория, чтение файлов)
+
+| Продукт | Ревизия | Что прочитано |
+|---|---|---|
+| Bucket4j 8.19.0 | `92553c54`, 2026-07-02 | `LockFreeBucket`, `SynchronizedBucket`, `SynchronizationStrategy`, `BucketState`, `BucketState64BitsInteger`, `MathType`, `Bandwidth`, `BandwidthBuilder`, `TimeMeter`, `Bucket`, `BlockingBucket`, `SchedulingBucket`, `LocalBucketBuilder`, `SerializationHandles`, весь `bucket4j-benchmarks/`, `lincheck-tests/`; плюс **удалённый** `BucketStateIEEE754` через `git show 0c072e0e^:...` |
+| Resilience4j | `a8a33164`, 2026-08-31 | `AtomicRateLimiter` (все 504 строки), `SemaphoreBasedRateLimiter`, `RateLimiter`, `RateLimiterConfig`, `RateLimiterEvent`, `RateLimiterBenchmark` |
+| Guava | `5fb424c4`, 2026-09-04 | `RateLimiter` (498 строк), `SmoothRateLimiter` (394 строки, включая `SmoothBursty` и `SmoothWarmingUp`) |
+| Netflix concurrency-limits | `78a74b98`, 2026-01-12 | `README.md`, `Limiter`, `Limit`, `AbstractLimiter`, `SimpleLimiter`, `AIMDLimit`, `VegasLimit`, `Gradient2Limit` |
+| Alibaba Sentinel (ветка 1.8) | `a3f40ba8`, 2026-05-27 | `DefaultController`, `ThrottlingController`, `WarmUpController`, `TokenBucket`/`AbstractTokenBucket`/`DefaultTokenBucket`/`StrictTokenBucket` |
+| Failsafe | `ed3f9273`, 2025-12-27 | `RateLimiterImpl`, `SmoothRateLimiterStats`, `BurstyRateLimiterStats` |
+| Apache Pekko | ветка `main` (через Contents API, точный SHA не фиксировал) | `util/TokenBucket.scala`, `stream/ThrottleMode.scala` |
+| Spring Cloud Gateway | ветка `main` (raw, SHA не фиксировал) | `request_rate_limiter.lua` |
+
+### Рассмотрено вне кода
+
+- GitHub issues google/guava #2797, #3300, #5612, #5959 — через `gh api`, с полными
+  тредами комментариев. Это источник ответа «почему до сих пор `@Beta`».
+
+### Отброшено и почему
+
+- **Hystrix** — упомянут в треде guava#5612, но это circuit breaker, а сами Netflix
+  указывают на переход к `concurrency-limits`; rate limiting там не основная функция.
+  Дублировал бы раздел про Netflix.
+- **`java.util.concurrent.Semaphore` сам по себе** — ограничивает конкурентность, а не
+  темп; покрыт косвенно через `SemaphoreBasedRateLimiter` и `SimpleLimiter`.
+- **Bucket4j distributed-модули** (`bucket4j-redis`, `-hazelcast`, `-postgresql` и ещё
+  ~12) — вне рамок single-process. Из распределённого взят только Spring Cloud Gateway
+  Lua-скрипт, и то потому, что он показывает, как ведёт себя ровно наш алгоритм в
+  IEEE754-арифметике Lua.
+- **Serialization/versioning-слой Bucket4j** (`SerializationHandle`, `Versions`,
+  `TokensInheritanceStrategy` в деталях) — большая и качественная часть библиотеки, но
+  нужна только распределённому режиму. Затронут ровно настолько, насколько объясняет
+  контракт `TimeMeter.isWallClockBased()`.
+- **Micrometer/Spectator-интеграции метрик** во всех библиотеках — инфраструктура, не
+  алгоритмы.
+- **Spring Cloud Gateway Java-классы фильтра** (`RequestRateLimiterGatewayFilterFactory`,
+  `RedisRateLimiter`, `KeyResolver`) — не читал, разобран только Lua-скрипт. Это
+  осознанный пропуск; отмечено в разделе как **не проверено**.
+- **`Gradient2Limit` целиком, `WindowedLimit`, окна перцентилей** у Netflix — прочитана
+  только формула обновления. Дальше — за пределами релевантности.
+- **Vert.x, Micronaut, Quarkus** — искал rate limiter как самостоятельный примитив, не
+  нашёл ничего, что не сводилось бы к обёртке над Bucket4j/Resilience4j. **Не проверено**
+  систематически, отброшено по низкой ожидаемой ценности.
+- **JMH-числа для любой из библиотек** — **не найдены ни у одной**. Харнессы есть
+  (`bucket4j-benchmarks`, `RateLimiterBenchmark`), опубликованных результатов прогонов в
+  репозиториях нет. Единственное утверждение о результатах — фраза «showed great results»
+  в javadoc Resilience4j без цифр. Прогонять самому не стал: это потребовало бы JDK,
+  Maven/Gradle и вечера машинного времени, а сопоставить с нашими Go-числами всё равно
+  было бы некорректно (другой рантайм, другая машина, другой профиль аллокаций).
+
+### Известные пробелы
+
+- Точные SHA для Pekko и Spring Cloud Gateway не зафиксированы (файлы получены через
+  API/raw ветки `main`, не через клон).
+- Версия Resilience4j не определяется по репозиторию — она задаётся при сборке снаружи.
+- Не проверял, публиковались ли бенчмарки Bucket4j/Resilience4j вне репозиториев
+  (блоги, доклады).
+- `LockFreeBucketLayout.java` (JOL-раскладка объекта) прочитан только целиком-по-виду:
+  это `main`, печатающий `ClassLayout.parseClass(LockFreeBucket.class)`; фактических
+  чисел раскладки в репозитории нет.
 
 ## Источники
 
-_(в работе)_
+1. Bucket4j — https://github.com/bucket4j/bucket4j (разбор по коммиту `92553c54b47d7308095ed4c438a7a170371a400f`, версия 8.19.0, Apache-2.0)
+2. Resilience4j — https://github.com/resilience4j/resilience4j (коммит `a8a33164256ddb6e4bbc168f5c47ac34a348ee7f`, Apache-2.0)
+3. Статья, на которую ссылается javadoc `AtomicRateLimiter#compareAndSet` — https://arxiv.org/abs/1305.5800
+4. Guava — https://github.com/google/guava (коммит `5fb424c43ae38bad86b18841954337af791b6685`, Apache-2.0)
+5. google/guava issue #5612 «Remove @Beta from com.google.common.util.concurrent.RateLimiter» (открыт, ассигнован cpovirk) — https://github.com/google/guava/issues/5612
+6. google/guava issue #2797 (закрыт как дубликат; содержит ответ cpovirk от 2017-04-26) — https://github.com/google/guava/issues/2797
+7. google/guava issue #3300 — https://github.com/google/guava/issues/3300
+8. google/guava issue #5959 — https://github.com/google/guava/issues/5959
+9. Netflix concurrency-limits — https://github.com/Netflix/concurrency-limits (коммит `78a74b9878d38c4c048b0304ce12a162ab7b7222`, Apache-2.0)
+10. Apache Pekko, `actor/src/main/scala/org/apache/pekko/util/TokenBucket.scala` — https://github.com/apache/pekko/blob/main/actor/src/main/scala/org/apache/pekko/util/TokenBucket.scala
+11. Apache Pekko, `stream/src/main/scala/org/apache/pekko/stream/ThrottleMode.scala` — https://github.com/apache/pekko/blob/main/stream/src/main/scala/org/apache/pekko/stream/ThrottleMode.scala
+12. Alibaba Sentinel — https://github.com/alibaba/Sentinel (ветка `1.8`, коммит `a3f40ba8e900c8489bd520274739f17235a7721c`, Apache-2.0)
+13. Failsafe — https://github.com/failsafe-lib/failsafe (коммит `ed3f92739669769274cf5c9567fd422929c20ad2`, Apache-2.0)
+14. Spring Cloud Gateway, `request_rate_limiter.lua` — https://github.com/spring-cloud/spring-cloud-gateway/blob/main/spring-cloud-gateway-server-webflux/src/main/resources/META-INF/scripts/request_rate_limiter.lua
+15. Bucket4j, коммит удаления `BucketStateIEEE754` — https://github.com/bucket4j/bucket4j/commit/0c072e0edc8208673014e90c8440f79501a644c0
