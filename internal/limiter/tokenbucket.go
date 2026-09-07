@@ -72,7 +72,7 @@ func (b *TokenBucket) AllowN(n int) bool {
 	b.tokens = min(b.capacity, b.tokens+elapsed.Seconds()*b.rate)
 	b.last = now
 
-	if b.tokens+admitEpsilon >= float64(n) {
+	if b.tokens+admitEpsilon(float64(n)) >= float64(n) {
 		b.tokens -= float64(n)
 		return true
 	}

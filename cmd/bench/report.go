@@ -62,7 +62,7 @@ func countDenied(rs []result) int {
 // millions of them — so samples are bucketed by the bit length of their
 // nanosecond value. That is 64 counters, zero allocation in the hot loop, and a
 // resolution of one power of two: a reported percentile is correct within a
-// factor of two. For ranking four algorithms against each other that is enough,
+// factor of two. For ranking a handful of algorithms against each other that is enough,
 // and it is more honest than printing a nanosecond figure that the sampling
 // method cannot support.
 type latencyHist struct {
