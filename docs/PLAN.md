@@ -60,11 +60,14 @@ internal/limiter/         # ядро-библиотека (Limiter + реали�
 ├── slidingwindow.go      # sliding window
 ├── leakybucket.go        # leaky bucket (leak-as-a-meter)
 ├── lockfree_tokenbucket.go # CAS-based lock-free token bucket (Этап 4)
+├── clock_test.go         # потокобезопасный fakeClock — общий тест-хелпер
+├── *_test.go             # по файлу тестов на алгоритм
 └── limiter_bench_test.go # микробенчмарки Serial/Parallel × 4 алгоритма (Этап 5)
 cmd/bench/                # CLI-харнесс: нагрузка + сравнительный отчёт (Этап 5)
 ├── main.go               # флаги, валидация, отображение -algo → конструктор
 ├── runner.go             # драйвер нагрузки и сбор метрик
-└── report.go             # гистограмма перцентилей + рендереры text/markdown
+├── report.go             # гистограмма перцентилей + рендереры text/markdown
+└── *_test.go             # тесты харнесса (main_test.go, report_test.go)
 ```
 
 Один общий контракт `Limiter` за портом; каждый алгоритм — отдельный файл-адаптер.
@@ -76,7 +79,7 @@ cmd/bench/                # CLI-харнесс: нагрузка + сравни�
 
 - **Этап 0 — Бутстрап.** `go mod init`, скелет пакета `internal/limiter` с портом
   `Limiter` и заглушками трёх реализаций, заглушка `cmd/bench`, вся документация,
-  SKILL. `go build`/`go vet` проходят чисто. *(этот этап)*
+  SKILL. `go build`/`go vet` проходят чисто.
 - **Этап 1 — Token bucket + база тестов.** Mutex-based token bucket, fake-clock,
   table-driven тесты корректности, первый `-race`-прогон.
 - **Этап 2 — Sliding window.** Реализация + тесты; фиксируем поведение на границе
@@ -86,6 +89,9 @@ cmd/bench/                # CLI-харнесс: нагрузка + сравни�
   `atomic`, stress-тест «сумма пропущенных ≤ лимита», обязательный `-race`.
 - **Этап 5 — Бенчмарк-сьют + отчёт.** `testing.B`-бенчмарки, CLI `cmd/bench`,
   сравнительная таблица throughput/latency, README с результатами.
+
+**Статус: Этапы 0–5 завершены, MVP собран.** Заглушек в коде не осталось.
+Сверяться при сомнении — с `git log` и содержимым `internal/limiter/`.
 
 ## 6. После MVP
 

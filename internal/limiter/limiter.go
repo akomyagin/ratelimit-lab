@@ -1,7 +1,8 @@
 // Package limiter defines the common rate-limiter contract and its
-// single-process algorithm implementations (token bucket, sliding window,
-// leaky bucket). All implementations must be safe for concurrent use by
-// multiple goroutines.
+// single-process algorithm implementations: a mutex-guarded token bucket,
+// weighted sliding window and leaky bucket, plus a lock-free CAS variant of the
+// token bucket (LockFreeTokenBucket) that the others serve as a baseline for.
+// All implementations must be safe for concurrent use by multiple goroutines.
 package limiter
 
 import "time"
